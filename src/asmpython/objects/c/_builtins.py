@@ -1400,7 +1400,7 @@ static apy_value apy_exc_class_named(const char *name) {
 
    A bundled module's classes are spliced under mangled names and the splice
    renames them back, so `copy.Error`'s cells still carry
-   `_asmpy_bundled_copy_Error` -- and they must, because `except copy.Error`
+   `_asmpy_bundled_4_copy_Error` -- and they must, because `except copy.Error`
    compiles to that spelling and `apy_error_matches` walks by name. Renaming
    the cell would fix the display and break the catch, so the mapping happens
    HERE: everything a program READS goes through this, everything that

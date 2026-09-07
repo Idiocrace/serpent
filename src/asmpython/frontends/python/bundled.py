@@ -41,11 +41,42 @@ def available() -> set[str]:
 
 
 def _mangled(module: str, name: str, prefix: str = None) -> str:
-    # THE DOT GOES. `collections.abc` is one bundled module with a dot in its
-    # name, and the rest of the frontend reads a dot in a key as "nested
-    # inside" -- so a name carrying one is not a module-level definition to
-    # anything downstream.
-    return f"{prefix or _MANGLE}{module.replace('.', '_')}_{name}"
+    """One symbol for one (module, member), and never for two.
+
+    THE DOT GOES. `collections.abc` is one bundled module with a dot in its
+    name, and the rest of the frontend reads a dot in a key as "nested
+    inside" -- so a name carrying one is not a module-level definition to
+    anything downstream.
+
+    AND THE DOT GOING IS WHY THIS NEEDS MORE THAN A REPLACE. It was
+    `prefix + module.replace('.', '_') + '_' + name`, which is two collisions
+    at once and both are SILENT -- one definition simply overwrites the other
+    and the program prints the survivor:
+
+        module `a.b`, member `X`  ->  ..._a_b_X
+        module `a_b`, member `X`  ->  ..._a_b_X   (the dot and the underscore
+                                                   flatten to the same thing)
+        module `a`,   member `b_X` -> ..._a_b_X   (nothing says where the
+                                                   module ends and the
+                                                   member begins)
+
+    Measured: a program importing `X` from `a.b` and from `a_b` printed
+    'a_b' twice where CPython printed both.
+
+    TWO CHANGES, ONE FOR EACH COLLISION. An underscore in the module doubles
+    before the dot becomes one, which is the ordinary escape and makes the
+    module component injective on its own. Then the component is LENGTH-
+    PREFIXED, which is the only thing that can say where it ends, because a
+    member name may contain an underscore too and no separator character is
+    illegal in a Python identifier.
+
+    The result is longer and still readable: `_asmpy_bundled_4_copy_Error`.
+    Nothing parses it -- a mangled exception class is mapped back to its
+    displayed name by LOOKING IT UP (`apy_exc_shown`), not by taking the
+    string apart -- and the two places that strip a known prefix still do.
+    """
+    escaped = module.replace("_", "__").replace(".", "_")
+    return f"{prefix or _MANGLE}{len(escaped)}_{escaped}_{name}"
 
 
 #: The builtins that need a compiler at run time, and the bundled module

@@ -71,10 +71,6 @@ KNOWN_DIVERGENT: dict[str, str] = {
         "`imports.py:437` does `rewritten.body = prelude + rewritten.body`, "
         "so an imported module's top-level statements run BEFORE the "
         "importing module's first statement rather than where the import is.",
-    "two_modules_whose_mangled_names_collide":
-        "`bundled._mangled` is `prefix + module.replace('.', '_') + '_' + "
-        "name`, so `a.b` and `a_b` mint the same symbol and the second "
-        "definition wins both. Prints 'a_b' twice.",
     "dotted_import_binds_the_head":
         "`import a.b.c` keys the rewrite map on the dotted string, while the "
         "rewriter matches only a bare `ast.Name` -- so `lib.sub.deep.where()` "

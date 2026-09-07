@@ -7,7 +7,7 @@
 # A SPLIT, AND ONLY ONE CASE MAKES IT ONE. Every kind here answers with a
 # literal or with a field read -- except an exception, whose displayed name is
 # not the name it matches: a bundled module's classes are spliced under
-# mangled names, so `copy.Error` carries `_asmpy_bundled_copy_Error` and
+# mangled names, so `copy.Error` carries `_asmpy_bundled_4_copy_Error` and
 # `apy_exc_shown` maps it back. That mapping is a class lookup, which is
 # still C, so an exception goes to the slow half and everything else stays
 # here.

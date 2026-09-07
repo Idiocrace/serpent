@@ -2225,7 +2225,7 @@ def _apy_type_name(h, a):
     THROUGH `_type_of` AND NOT STRAIGHT TO `kind_name`. The fused shape has to
     answer what the unfused one does, and `kind_name` reads an exception's own
     NAME STRING rather than the class behind it -- so a bundled module's
-    exception, whose class the splice renames from `_asmpy_bundled_copy_Error`
+    exception, whose class the splice renames from `_asmpy_bundled_4_copy_Error`
     back to `Error`, showed the internal spelling. `t = type(e); t.__name__`
     was right and `type(e).__name__` was not, for the same object, because
     only one of them came through here.
@@ -3650,7 +3650,7 @@ def _rename_exception(h, was: str, now: str, cls) -> None:
     registered leaves the two disagreeing. That is not a hypothetical: a
     BUNDLED module's classes are spliced under mangled names and the splice
     then restores `__name__` -- precisely so the mangling stays invisible --
-    so `copy.Error` registered as `_asmpy_bundled_copy_Error` and then started
+    so `copy.Error` registered as `_asmpy_bundled_4_copy_Error` and then started
     calling itself `Error`. `issubclass(copy.Error, Exception)` asks the table
     for `Error`, finds nothing, and answers False for a class whose `class`
     statement plainly names Exception as its base.

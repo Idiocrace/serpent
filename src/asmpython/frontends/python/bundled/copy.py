@@ -14,7 +14,7 @@ hierarchy under one spelling and asking about itself under the other. The
 registration follows the rename now.
 
 WHAT STILL LEAKS is the printed type of a RAISED one: `type(e).__name__`
-answers `_asmpy_bundled_copy_Error` where CPython says `Error`. Catching it,
+answers `_asmpy_bundled_4_copy_Error` where CPython says `Error`. Catching it,
 `issubclass` and `isinstance` are all correct; only the name a traceback or a
 `print(type(e))` shows is the internal spelling. See `docs/STDLIB.md`.
 

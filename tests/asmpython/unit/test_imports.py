@@ -3,7 +3,14 @@
 `frontends/python/imports.py` is the first half of compiling more than one
 file. It answers "which file does this import statement mean", and nothing
 else -- the second half, splicing the source it finds, is `bundled.py`'s
-machinery and is not wired up yet.
+machinery.
+
+IT IS WIRED UP, and this said it was not. `imports.splice` is called from
+`PythonFrontend.compile` and has been since the commit after the one that
+added it; the sentence stayed for every commit since, telling a reader that
+the resolver they were about to change had no consumer.
+`tests/asmpython/integration/test_imports_corpus.py` is where the spliced
+result is measured against CPython.
 
 WHY IT IS TESTED ALONE. The resolution rules are where multi-module
 compilation goes quietly wrong: an off-by-one in the relative-import level
@@ -165,3 +172,47 @@ class TestReadingIsCached:
     def test_reading_something_absent_names_where_it_looked(self, finder):
         with harness.raises(ImportError_):
             finder.read("nothing_at_all")
+
+
+class TestOneSymbolPerMemberAndNeverTwo:
+    """`_mangled` must be injective, because a collision is SILENT.
+
+    Two definitions minting one symbol is not a crash and not a diagnostic:
+    the second overwrites the first and the program prints the survivor. All
+    three shapes below did exactly that.
+    """
+
+    def test_a_dot_and_an_underscore_are_different_modules(self):
+        from asmpython.frontends.python.bundled import _mangled
+        assert _mangled("a.b", "X") != _mangled("a_b", "X")
+
+    def test_the_module_and_the_member_cannot_run_together(self):
+        """`a.b` + `X` and `a` + `b_X` flattened to the same symbol, because
+        nothing said where the module component ended."""
+        from asmpython.frontends.python.bundled import _mangled
+        assert _mangled("a.b", "X") != _mangled("a", "b_X")
+
+    def test_it_is_injective_over_a_sweep(self):
+        from asmpython.frontends.python.bundled import _mangled
+        modules = ["a", "a.b", "a_b", "a._b", "a.b.c", "a__b", "copy",
+                   "collections.abc", "_pylex", "a.b_c", "a_b.c"]
+        members = ["X", "b_X", "Error", "_p", "a_b_X", "c_X"]
+        seen: dict[str, tuple[str, str]] = {}
+        for module in modules:
+            for member in members:
+                symbol = _mangled(module, member)
+                assert symbol not in seen, (
+                    f"{(module, member)} and {seen[symbol]} both mint "
+                    f"{symbol!r}")
+                seen[symbol] = (module, member)
+
+    def test_the_real_name_is_still_recoverable_by_prefix(self):
+        """Both splices restore `__name__` by stripping `_mangled(module, '')`
+        off the front, so that has to stay a prefix of the whole symbol."""
+        from asmpython.frontends.python.bundled import _mangled
+        for module, member in (("copy", "Error"), ("a.b", "X"),
+                               ("a_b", "X"), ("collections.abc", "Iterable")):
+            full = _mangled(module, member)
+            head = _mangled(module, "")
+            assert full.startswith(head)
+            assert full[len(head):] == member

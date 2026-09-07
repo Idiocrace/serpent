@@ -1150,7 +1150,7 @@ APY_API apy_value apy_setattr(apy_value obj, apy_value name, apy_value value) {
            the two disagreeing. Not hypothetical: a BUNDLED module's classes
            are spliced under mangled names and the splice then restores
            `__name__` -- precisely so the mangling stays invisible -- so
-           `copy.Error` registered as `_asmpy_bundled_copy_Error` and then
+           `copy.Error` registered as `_asmpy_bundled_4_copy_Error` and then
            started calling itself `Error`, and `issubclass(copy.Error,
            Exception)` asked the table for `Error`, found nothing, and answered
            False for a class whose `class` statement names Exception as its
