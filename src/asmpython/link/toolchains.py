@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .. import target as target_registry
 from ..target import Target
 from .base import LinkError, LinkRequest, Toolchain, find_tool, run
 from .registry import register
@@ -76,8 +77,19 @@ class CcToolchain(Toolchain):
         # and is a harmless empty stub on newer ones, which is why it is
         # unconditional rather than probed. Windows needs neither, because
         # both `fmod` and `LoadLibraryA` are in what the CRT links already.
-        system_libs = (["-lm", "-ldl"]
-                       if request.target.object_format == "elf" else [])
+        #
+        # A source target (the C backend's default, `object_format="source"`)
+        # has no object format of its own -- the actual format is whatever the
+        # `cc` on PATH produces, which is the HOST's unless the target names
+        # its own cross driver. Reading `object_format` straight off a source
+        # target here always says "not elf", so every default `asmpython
+        # build` -- the README's very first example -- failed to link on
+        # Linux the moment the spliced-in runtime referenced `floor` or
+        # `fmod`, which is every program, not just ones using floats.
+        object_format = (target_registry.host().object_format
+                         if request.target.is_source
+                         else request.target.object_format)
+        system_libs = ["-lm", "-ldl"] if object_format == "elf" else []
         argv = [cc, *inputs, "-o", str(output), *request.extra_inputs,
                 *system_libs]
         run(request, argv, what="linking")
