@@ -713,8 +713,12 @@ class TestAgreement:
         rt = tmp_path / "rt.c"
         rt.write_text(_runtime_c("main_ir", module), encoding="utf-8")
         exe = tmp_path / "out.exe"
-        built = subprocess.run([HAS_CC, str(s_file), str(rt), "-o", str(exe)],
-                               capture_output=True, text=True)
+        # -lm -ldl: the object runtime calls libm (floor, fmod, ...) and libdl
+        # unconditionally, needed on every ELF host -- see toolchains.py.
+        system_libs = [] if sys.platform == "win32" else ["-lm", "-ldl"]
+        built = subprocess.run(
+            [HAS_CC, str(s_file), str(rt), "-o", str(exe), *system_libs],
+            capture_output=True, text=True)
         assert built.returncode == 0, built.stderr
         ran = subprocess.run([str(exe)], capture_output=True, text=True)
         assert ran.stdout.split("\n")[:-1] == want_out
@@ -732,7 +736,10 @@ class TestAgreement:
         c_file = tmp_path / "out.c"
         c_file.write_bytes(get("c").emit(module, get_target("c"))["out.c"])
         exe = tmp_path / "out.exe"
-        built = subprocess.run([HAS_CC, str(c_file), "-o", str(exe)],
+        # -lm -ldl: the object runtime calls libm (floor, fmod, ...) and libdl
+        # unconditionally, needed on every ELF host -- see toolchains.py.
+        system_libs = [] if sys.platform == "win32" else ["-lm", "-ldl"]
+        built = subprocess.run([HAS_CC, str(c_file), "-o", str(exe), *system_libs],
                                capture_output=True, text=True)
         assert built.returncode == 0, built.stderr
         ran = subprocess.run([str(exe)], capture_output=True, text=True)

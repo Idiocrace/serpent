@@ -163,7 +163,10 @@ def build_and_run(text: str, backend: str, tmp_path) -> int:
         from asmpython.objects import write_runtime
         inputs.append(str(write_runtime(tmp_path)))
     exe = tmp_path / "out.exe"
-    built = subprocess.run([HAS_CC, *inputs, "-o", str(exe)],
+    # -lm -ldl: the object runtime calls libm (floor, fmod, ...) and libdl
+    # unconditionally, needed on every ELF host -- see toolchains.py.
+    system_libs = [] if sys.platform == "win32" else ["-lm", "-ldl"]
+    built = subprocess.run([HAS_CC, *inputs, "-o", str(exe), *system_libs],
                            capture_output=True, text=True)
     assert built.returncode == 0, built.stderr
     return subprocess.run([str(exe)], capture_output=True).returncode

@@ -499,7 +499,10 @@ class TestTheLayoutIsTheCs:
         c = tmp_path / "probe.c"
         c.write_text(probe, encoding="utf-8")
         exe = tmp_path / "probe.exe"
-        built = subprocess.run(["gcc", "-w", str(c), "-o", str(exe)],
+        # -lm -ldl: the runtime probe calls libm (floor, fmod, ...) and libdl
+        # unconditionally, needed on every ELF host -- see toolchains.py.
+        system_libs = [] if sys.platform == "win32" else ["-lm", "-ldl"]
+        built = subprocess.run(["gcc", "-w", str(c), "-o", str(exe), *system_libs],
                                capture_output=True, text=True)
         assert built.returncode == 0, built.stderr[-3000:]
         out = subprocess.run([str(exe)], capture_output=True, text=True).stdout

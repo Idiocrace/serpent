@@ -4737,7 +4737,10 @@ class TestEveryPathAgrees:
         c_file = tmp_path / "out.c"
         c_file.write_bytes(get("c").emit(module, get_target("c"))["out.c"])
         exe = tmp_path / "out.exe"
-        built = subprocess.run([HAS_CC, str(c_file), "-o", str(exe)],
+        # -lm -ldl: the object runtime calls libm (floor, fmod, ...) and libdl
+        # unconditionally, needed on every ELF host -- see toolchains.py.
+        system_libs = [] if sys.platform == "win32" else ["-lm", "-ldl"]
+        built = subprocess.run([HAS_CC, str(c_file), "-o", str(exe), *system_libs],
                                capture_output=True, text=True)
         assert built.returncode == 0, built.stderr
         # UTF-8, NOT THE LOCALE ENCODING. A str is stored as UTF-8 by this
