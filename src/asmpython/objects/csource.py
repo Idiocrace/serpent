@@ -145,7 +145,7 @@ OBJECT_NAMES = (
     "apy_inspect_isasyncgen", "apy_inspect_iscoroutinefunction",
     "apy_is_instance", "apy_exc_register",
     "apy_method_is_builtin", "apy_method_self",
-    "apy_range", "apy_sorted", "apy_min", "apy_max", "apy_sum", "apy_reversed", "apy_enumerate", "apy_zip2", "apy_abs", "apy_round", "apy_isinstance", "apy_slice", "apy_list_pop", "apy_index_of", "apy_count_of", "apy_list_remove", "apy_dict_parts", "apy_dict_get_or",
+    "apy_range", "apy_sorted", "apy_min", "apy_max", "apy_sum", "apy_reversed", "apy_enumerate", "apy_zip2", "apy_abs", "apy_index_obj", "apy_round", "apy_isinstance", "apy_slice", "apy_list_pop", "apy_index_of", "apy_count_of", "apy_list_remove", "apy_dict_parts", "apy_dict_get_or",
     "apy_list_new", "apy_tuple_new", "apy_seq_push", "apy_getitem",
     "apy_dict_new", "apy_dict_set", "apy_key_at",
     "apy_setitem", "apy_raw_len",

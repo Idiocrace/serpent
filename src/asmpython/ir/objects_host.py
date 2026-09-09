@@ -6921,6 +6921,32 @@ def _apy_abs(h, a):
     return h._value(abs(v))
 
 
+def _apy_index_obj(h, a):
+    """`v.__index__()` called directly -- the BOXED twin of `_apy_index`
+    above, which the compiler emits for a subscript and unpacks to a machine
+    word instead. `operator.index` reaches this one, and asked for it: the
+    method was simply absent from `DYN_METHOD_TABLE`
+    (`frontends/python/methods.py`), so `(7).__index__()` traded a working
+    call for `AttributeError: 'int' object has no attribute '__index__'`.
+
+    A BOOL ANSWERS AN int, NOT ITSELF -- `True.__index__()` is `1` and
+    `type(1)` is not `bool`, same as `_apy_abs` below has to keep straight
+    for `abs(True)`. Python's own arbitrary-precision `int` is what a value
+    already IS here, so there is no separate big-integer case to keep in
+    step with the boxed C twin's.
+    """
+    v = h._get(a[0], "apy_index_obj")
+    if isinstance(v, Instance) and v.cls.find("__index__") is not None:
+        return _user(h, lambda: h._value(v._send("__index__")))
+    if isinstance(v, bool):
+        return h._value(int(v))
+    if isinstance(v, int):
+        return h._value(v)
+    return h._fail("TypeError",
+                   f"'{h.kind_name(v)}' object cannot be interpreted as "
+                   f"an integer")
+
+
 def _apy_round(h, a):
     _v = h._get(a[0], "apy_round")
     # `__round__` WITH NO DIGITS. A class defining it decides what rounding
@@ -8050,6 +8076,7 @@ _TABLE.update({
     "apy_zip2": _apy_zip2,
     "apy_range": _apy_range,
     "apy_abs": _apy_abs,
+    "apy_index_obj": _apy_index_obj,
     "apy_round": _apy_round,
     "apy_isinstance": _apy_isinstance,
     "apy_slice": _apy_slice,
