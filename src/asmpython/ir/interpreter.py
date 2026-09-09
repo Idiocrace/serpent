@@ -147,6 +147,13 @@ class Interpreter:
             if g.data:
                 self.mem.buf[addr:addr + len(g.data)] = g.data
             self.globals[g.name] = addr
+        #: Every global is allocated here, upfront, before any function
+        #: runs -- `Op.STORE`'s refcounting hook uses this to tell a
+        #: global's address from an `alloca`'s. `self.mem` is a bump
+        #: allocator (`Memory.alloc` only ever grows `brk`), so an address
+        #: below this boundary is a global FOR THE REST OF THE RUN and one
+        #: at or above it never is -- no per-instruction tracking needed.
+        self._globals_end = self.mem.brk
 
     # ── host functions ──────────────────────────────────────────────────────
     # The IR has no I/O opcodes -- printing is not a machine operation. A
@@ -749,7 +756,23 @@ class Interpreter:
             # around. The same accepted imprecision applies as there: a
             # `ptr` store can be a raw address rather than a handle, and
             # nothing here tells them apart -- see `put()`'s own comment.
-            if self.objects is not None and ty is T.PTR:
+            #
+            # ONLY A GLOBAL'S ADDRESS (`addr < self._globals_end`), not
+            # every `Op.STORE` -- an `alloca`'d address is this opcode's
+            # OTHER use, chiefly the argument buffer every `apy_call`-style
+            # call builds (`%b = ptr.alloca 8; ptr.store %arg, %b`, then
+            # `apy_call(fn, %b, 1)`): that buffer is written once and never
+            # read again by anything this scheme tracks, so hooking it
+            # here increfed the ARGUMENT on every single call it was
+            # passed to, with NOTHING ever decrefing that phantom
+            # ownership -- an unbounded leak, not merely a delayed one,
+            # confirmed by `sys.getrefcount` climbing on every call
+            # touching the same object and by a value passed once as a
+            # plain function argument never finalizing at all. Ordinary
+            # locals never reach here regardless (`dynamic.py` gives them
+            # a register, written via `Op.COPY` -- see `put()`), so
+            # narrowing this to globals loses nothing else.
+            if self.objects is not None and ty is T.PTR and addr < self._globals_end:
                 old = self.mem.read(addr, ty)
                 v = a(0)
                 self.mem.write(addr, ty, v)
