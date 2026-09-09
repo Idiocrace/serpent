@@ -944,7 +944,6 @@ static void apy_union_arms(apy_value into, apy_value v) {
     apy_union_arm(into, v);
 }
 
-
 /* Is this a UNION -- `int | str` -- rather than some other parameterised
    form? `apy_is_type_like` above accepts any INST_K origin, which every
    `typing` special form has, and that is too loose here: only a union's arms

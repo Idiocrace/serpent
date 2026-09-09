@@ -397,9 +397,6 @@ class _Rewrite(ast.NodeTransformer):
         # of what they need.
         if node.id == "print" and self.redirects:
             node.id = _mangled("sys", "_print")
-        # `compile()` IS THE BUNDLED ONE. See `_RUNTIME_COMPILER`: the name is
-        # a builtin, so nothing imports it, and the module is spliced because
-        # the name appears at all.
         # `compile()` IS THE BUNDLED ONE, and so are `eval` and `exec`.
         # See `_RUNTIME_COMPILER`: the names are builtins, so nothing
         # imports them, and the module is spliced because the name
