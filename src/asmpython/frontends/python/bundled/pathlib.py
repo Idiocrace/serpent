@@ -333,10 +333,21 @@ _EACCES = -3
 _EEXIST = -4
 _ENOTEMPTY = -6
 
-#: What text mode writes for `\n`. This module is POSIX-flavoured
-#: and Windows-hosted, which the docstring records; it is a named constant
-#: so the POSIX variant is a one-line change rather than a search.
-_LINESEP = "\r\n"
+#: What text mode writes for `\n` -- CPython's `os.linesep`, which this
+#: module has no way to ask the host for (no `os` bundled yet, and the
+#: point of going through `objects/hostsvc.py` was that a module "has no
+#: business knowing which operating system it is on", per this file's own
+#: docstring). `"\r\n"` here PREVIOUSLY ASSUMED a Windows host regardless of
+#: what actually ran the program -- wrong on every target this differential
+#: suite is checked against (Linux, and every other currently-supported
+#: target: macOS, bare-metal, the JVM; none use `\r\n`), so `write_text`
+#: inserted a carriage return CPython's own `os.linesep` on this host never
+#: would, and `read_bytes` could see it. `"\n"` is correct for everything
+#: this module is actually verified on today; a genuine Windows target
+#: needs the host to say so, which is the same open question as the path
+#: separator FLAVOUR above -- not answered yet, and named here so it is a
+#: one-line change once it is.
+_LINESEP = "\n"
 
 
 def _glob_match(name, pattern):
