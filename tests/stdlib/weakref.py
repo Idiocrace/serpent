@@ -105,4 +105,42 @@ def count_of_unreferenced():
 
 
 count_of_unreferenced()
+print("--- count_of_unreferenced done ---")
+
+
+# --- a referent that was passed into a call ----------------------------
+#
+# THE SHAPE A WEAKREF IS ACTUALLY WRITTEN IN. `weakref.ref(obj)` is
+# itself a call, and so is every method call and every constructor, so a
+# referent that goes dead only after the LAST NAME for it is dropped is
+# the whole test: an argument still counted by whoever was called would
+# keep the referent answering long after `del`.
+def looked_at(o):
+    return o.name
+
+
+def passed_around():
+    p = Foo("p")
+    r = weakref.ref(p)
+    print("read through a call:", looked_at(p))
+    print("alive while named:", r() is not None)
+    del p
+    print("dead once the name is gone:", r() is None)
+
+
+passed_around()
+print("--- passed_around done ---")
+
+
+def through_a_container():
+    q = Foo("q")
+    r = weakref.ref(q)
+    held = [q]
+    del q
+    print("still held by the list:", r() is not None)
+    held.clear()
+    print("dead once the list lets go:", r() is None)
+
+
+through_a_container()
 print("done")

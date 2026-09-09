@@ -81,15 +81,18 @@ rather than a bundled module, and is unaffected.
 
 ## When an object dies, and how exactly that is known
 
-`weakref` is in the table below, and it could not be until the runtime could
-answer a question it had never been asked: WHEN does an object stop existing?
-The reference interpreter now keeps a SHADOW REFERENCE COUNT
+`weakref` and `gc` are in the table below, and neither could be until the
+runtime could answer a question it had never been asked: WHEN does an object
+stop existing? The reference interpreter now keeps a SHADOW REFERENCE COUNT
 (`ir/objects_host.py`'s `incref`/`decref`, hooked from `ir/interpreter.py`'s
 one register-write choke point) whose only job is to make what a Python
 program can OBSERVE about lifetime match CPython: `__del__` at the right
 statement, a `weakref` going dead at the right statement, and a reference
-CYCLE surviving both -- which falls out of true refcounting for free, with
-nothing added, exactly as it does in CPython.
+CYCLE surviving both until `gc.collect()` -- which falls out of TRUE
+refcounting for free, with nothing added: a cycle's members hold each
+other's counts above zero, so no amount of counting collects one, which is
+exactly why CPython ships a second mechanism under that name and why this
+does too.
 
 It is a SHADOW count. Nothing is freed; `docs/INERT-RUNTIME.md`'s memory
 story is untouched, and a compiled build keeps no count at all (which is why
@@ -97,32 +100,60 @@ story is untouched, and a compiled build keeps no count at all (which is why
 cannot know).
 
 **EXACT, measured against CPython as the oracle:** a name dropped by `del`,
-by reassignment, or by its function returning; an object dropped by the
-container holding it (`list`/`dict`/`set` element, instance attribute) being
-overwritten, removed or cleared; `x is None` on a value nothing else holds.
+by reassignment, or by its function returning; a value PASSED INTO A CALL
+and dropped afterwards -- `f(x); del x` -- including a call through an
+argument buffer, which is every method call, every class instantiation and
+`weakref.ref(x)` itself; an object dropped by the container holding it
+(`list`/`dict`/`set` element, instance attribute) being overwritten, removed
+or cleared; `x is None` on a value nothing else holds; a reference CYCLE
+broken by `gc.collect()`, and one NOT broken by it because something outside
+still points at the cycle; `sys.getrefcount` for every reference a program
+itself makes. The ORDER several objects dying at the same moment are
+finalized in is exact too, for the three shapes that have one: a frame's
+locals go in reverse (CPython's own order, checked), a list's elements go in
+reverse (CPython's `list_dealloc` walks its array backwards), and a dict's
+entries go forward. So are the two orders `gc.collect()` has: a weakref
+callback for a collected cycle fires BEFORE the cycle is torn down, and a
+callback whose own `ref` is inside the same garbage does not fire at all --
+both CPython's documented behaviour, both checked against it.
 
 **LATE, NEVER EARLY, and this is the direction the whole scheme is built to
 be wrong in** -- an under-decref delays a finalizer, an over-decref runs one
 while the object is still in use:
 
-* a value held only by a TEMPORARY that was passed into a call -- `f(Foo())`,
-  or a deref's result read by anything but `is` -- dies when the enclosing
-  frame ends rather than at the end of the statement. Retiring those
-  temporaries needs every callee to be known not to keep what it is handed;
-  `ir/interpreter.py`'s `_NON_RETAINING` is that list, and it holds exactly
-  the names whose bodies have been read.
-* a value held only by a TUPLE. A tuple handle is not reference-counted at
-  all (`_INTERNED` deliberately does not intern tuples, so nothing ever
-  decrefs one), so a tuple neither keeps its elements alive nor releases
-  them; they answer to whatever else holds them.
-* a value held only by a CLOSURE CELL. `apy_cell_set` does not incref what it
-  stores, the one heap-mutation site left unhooked.
-* the ORDER of several objects finalized at the same moment -- a frame's
-  locals at return, a list's elements when the list dies. CPython's own order
-  is an implementation detail of its deallocator; this walks its own.
-* a reference CYCLE, which needs `gc.collect()` -- not yet built. CPython
-  leaves cycles to the same separate mechanism, so a program that never calls
-  it sees the same thing either way.
+* a value passed into a HOST PRIMITIVE whose body has not been audited. A
+  call retires its argument temporaries only when the callee is known to
+  take its own counted reference to anything it keeps. For a call into
+  compiled Python that is true BY CONSTRUCTION -- `_call` increfs every
+  pointer parameter on entry and drops it at teardown, and every way a
+  Python body can keep a value past its return counts it -- so
+  `ir/interpreter.py`'s `_interpreted` covers all of those at once, and
+  `f(x); del x` finalizes exactly where CPython does. For the two hundred
+  `apy_*` primitives it is true one at a time, and `_NON_RETAINING` holds
+  the ones actually read: `apy_is`, the three container stores, and the two
+  cell stores. `x.attr = v` is the notable absentee -- `apy_setattr` has a
+  descriptor branch and a `__setattr__` branch, so an attribute-held value
+  waits for frame teardown.
+* a value held only by a CLOSURE CELL. The cell counts its contents now (it
+  had to, before a call argument could be retired at all), but a FUNCTION
+  does not count its cells' deaths: a function's own handle count is not
+  maintained well enough to cascade from -- `_invoke_obj` pins and unpins a
+  closure around every call to it, and that unpin found the count at zero.
+  So a captured value outlives the closure that captured it.
+* a value read back out of a container into a temporary and then discarded,
+  in a function containing a LOOP. `_analyze` retires a temporary at its
+  last STATIC read, which is only the last dynamic one when the function
+  has no back edge; a loop switches the whole optimisation off for that
+  function.
+* everything still alive when the PROGRAM ENDS. CPython runs a final
+  collection at interpreter shutdown and a `__del__` still pending then runs
+  there; this stops instead. What a program prints before its last statement
+  matches; what CPython prints after it does not.
+* `sys.getrefcount(o)` asked by a function ABOUT ITS OWN PARAMETER reads one
+  higher: that binding is a counted reference here and CPython's interpreter
+  borrows it from the caller's frame. Every reference a PROGRAM makes -- a
+  name, a list or set membership, a dict value, an attribute -- counts
+  identically in both.
 
 ## Rebuilt so far
 
@@ -164,6 +195,8 @@ while the object is still in use:
 | `statistics` | `mean`, `fmean` (`weights=`), `geometric_mean`, `harmonic_mean` (`weights=`), `median`/`median_low`/`median_high`/`median_grouped`, `mode`, `multimode`, `variance`/`pvariance`, `stdev`/`pstdev`, `quantiles` (exclusive/inclusive), `covariance`, `correlation` (linear/ranked), `linear_regression`, `NormalDist` (full surface, including `pdf`/`cdf`/`inv_cdf`/`samples`/`from_samples` and arithmetic). `mean`/`variance`/`stdev`/`harmonic_mean` sum exactly through `Fraction` (CPython's own private `_sum`/`_ss`, ported) rather than a naive float loop, and `stdev`/`pstdev` finish with a correctly-rounded rational square root rather than double-rounding. NOT `Decimal` interop, `NormalDist.overlap`, `kde`/`kde_random` -- each needs a transcendental function this runtime does not have. |
 | `datetime` | `timedelta` (all seven constructor keywords, CPython's exact normalization, full arithmetic/comparison), `date` (construction, `.today`/`.fromordinal`/`.fromtimestamp`, `.weekday`/`.isocalendar`, `.isoformat`/`.strftime` for the common directives, `.replace`, arithmetic, comparison including against `datetime`), `time` (construction incl. `tzinfo`/`fold`, `.isoformat` with every timespec, naive/aware comparison), `timezone` (fixed-offset only, a real `utc` singleton), `datetime` (`.now`/`.utcnow`/`.fromtimestamp`, `.combine`, `.timestamp`, `.astimezone`, `.strftime`/`.strptime`, arithmetic, comparison). NOT `zoneinfo`/real IANA timezones, `fromisoformat`, `ctime`, `__format__`, pickling; there is no host timezone lookup, so a naive `now()`/`fromtimestamp()` treats local time as UTC. |
 | `traceback` | `format_exception_only`, `format_exception`, `print_exception`, `format_tb`/`print_tb`, `extract_tb`, `StackSummary`, `FrameSummary`, `TracebackException`/`.from_exception` -- exception chaining (`raise X from Y`, implicit `__context__`, `from None`), `__notes__`, and the ONE real frame `e.__traceback__` carries. NOT `format_exc`/`print_exc` -- there is no `sys.exc_info`; a bare `raise` resolves at COMPILE TIME against a lexical stack of enclosing `except` blocks rather than runtime thread state, so these are refused as fundamentally unimplementable rather than merely unwritten -- `walk_tb`/`walk_stack`/`extract_stack`/`format_stack`/`print_stack` (no call stack to walk), quoted source lines (`co_filename` is always `<compiled>`), `SyntaxError`'s multi-line format, `BaseExceptionGroup`'s tree format. |
+| `sys` (`getrefcount`) | `sys.getrefcount(obj)`, answering the shadow count. EXACT against CPython 3.14 for every reference a PROGRAM makes -- a name bound and unbound, a list or set membership, a dict value, an instance attribute, and each of those removed again. ONE SHAPE READS ONE HIGHER: a function asking about its own PARAMETER, since that binding is a counted reference here and one CPython 3.14's interpreter borrows from the caller instead. INTERPRETER-ONLY. The rest of `sys` is unchanged and stays in `frontends/python/modules.py`'s native table. |
+| `gc` | `collect()` -- a real cycle collector, CPython's own algorithm: subtract the references a candidate set makes to ITSELF from its members' counts, and whatever is left with nothing outside pointing at it is garbage. Finalizes it (`__del__`, weakref callbacks) and answers how many. `isenabled()`. INTERPRETER-ONLY, like `weakref` and for the same reason. NOT `enable`/`disable`, thresholds, `get_objects`/`get_referrers`/`get_referents`/`get_stats`, the debug flags, `garbage`, `freeze`/`unfreeze`, `is_tracked` -- there are no generations and no automatic runs here, so each would be a knob attached to nothing; refused BY NAME. |
 | `weakref` | `ref(obj)` and `ref(obj, callback)`, calling a ref to get the referent or `None`, the interning of callback-free refs (`ref(o) is ref(o)`, as CPython interns them), `__eq__`/`__hash__`, `getweakrefcount`, and the `TypeError` for a target that cannot be weakly referenced. The callback fires when the referent's last reference drops and receives the REF, per CPython's convention. INTERPRETER-ONLY: it reads the shadow reference count below, which a compiled build does not keep, so its two primitives refuse BY NAME there. NOT `proxy`, `finalize`, `WeakValueDictionary`, `WeakKeyDictionary`, `WeakSet` -- each refused BY NAME, and each for its own reason (see the module docstring). |
 | `typing` | `TypeVar`, `Generic` with a real `__class_getitem__` (`.__origin__`/`.__args__`), `NewType`, `cast`, `overload`, `Protocol` + `runtime_checkable` (structural `isinstance`), `get_type_hints` (built on `annotationlib`), `NamedTuple`/`TypedDict` in the FUNCTIONAL FORM only. Everything annotation-only (`Any`, `Union`, `Optional`, `Callable`, `Literal`, `Annotated`, `ParamSpec`, `final`, `override`, `get_origin`, `get_args`, ...) stays on the native `_TYPING` table, unchanged -- a bundled member always wins over the native table entry for the same name, so the two coexist without conflict. NOT class-based `NamedTuple`/`TypedDict` or attribute-only `Protocol` members, refused BY NAME: an annotation-only class-body statement never reaches a custom metaclass's `__new__` in this frontend, since the PEP 649 thunk is wired onto the class object only after the class statement completes. |
 

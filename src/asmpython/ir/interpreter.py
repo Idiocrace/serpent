@@ -67,6 +67,21 @@ class Frame:
     #: Python variable is told from a compiler temporary. Shared across
     #: calls (purely static, from `_analyze`), unlike `remaining`.
     named: frozenset[int] = frozenset()
+    #: Argument-buffer address -> the handles this frame took a reference
+    #: to on that buffer's behalf. See `Op.STORE`: an `apy_call`-style call
+    #: passes its arguments through an `alloca`'d array rather than as call
+    #: operands, so the BUFFER is what owns them for the length of the
+    #: call, and the register that loaded each one can be retired at the
+    #: store. Released by the call that reads the buffer (`Op.CALL`, when
+    #: an operand's value IS this address), and at frame teardown for a
+    #: buffer no call ever consumed -- which leaks a count rather than
+    #: dropping one early, the direction this scheme errs in.
+    argbuf: dict = field(default_factory=dict)
+    #: `(start, end)` for every `alloca` this invocation has made, so a
+    #: store into the middle of an argument array can be attributed to the
+    #: array. Per-invocation: the addresses come from `Memory.alloc` and
+    #: differ between calls to the same function.
+    allocas: list = field(default_factory=list)
 
 
 class Memory:
@@ -436,13 +451,28 @@ class Interpreter:
                 # and for the same reason.
                 if returned:
                     self.objects.protect_handoff(returned)
-                for reg, ty in fr.func.registers.items():
+                # REVERSED, and it is observable: when several objects
+                # die at the same moment their `__del__`s run in some
+                # order, and CPython's is the reverse of the order the
+                # frame acquired them. Measured against it -- two locals,
+                # a list's elements, a comprehension's results -- and
+                # forward order disagreed with all three where reverse
+                # agrees with all three.
+                for reg, ty in reversed(fr.func.registers.items()):
                     if ty is not T.PTR:
                         continue
                     val = fr.registers.get(reg)
                     if not val:
                         continue
                     self.objects.decref(val)
+                # A BUFFER NO CALL EVER CLAIMED -- see `Frame.argbuf`.
+                # `apy_print`'s array and anything else built the same way
+                # but read by a call this does not recognise ends up here
+                # rather than never being released at all.
+                for held in fr.argbuf.values():
+                    for h in held:
+                        self.objects.decref(h)
+                fr.argbuf.clear()
 
     def _analyze(self, fn: Function) -> tuple[bool, dict[int, int], frozenset[int]]:
         """Whether `fn` has a loop, how many times each `T.PTR` register is
@@ -580,6 +610,92 @@ class Interpreter:
             color[label] = BLACK
             stack.pop()
         return False
+
+    def _would_consume(self, fr: Frame, reg: int) -> bool:
+        """Whether `_consume(fr, reg)` would actually retire the register,
+        asked WITHOUT spending the read.
+
+        `Op.STORE` into an argument buffer needs this because the transfer
+        it does is an incref-then-consume PAIR: the buffer takes the
+        reference the register gives up, and the value's total is
+        unchanged. If the register is not going to give one up -- it is a
+        named variable, or is read again later -- then the incref alone
+        is a reference that did not exist before, which `sys.getrefcount`
+        reads back and reports. Measured: `x = C(); sys.getrefcount(x)`
+        answered 2 where CPython answers 1, purely because the call's own
+        argument buffer had claimed one.
+        """
+        if fr.remaining is None or self.objects is None or reg in fr.named:
+            return False
+        left = fr.remaining.get(reg)
+        return left is not None and left <= 1
+
+    @staticmethod
+    def _argbuf_base(fr: Frame, addr: int) -> int | None:
+        """Which of this invocation's `alloca`s `addr` falls inside, or
+        `None` for an address that is not one of them at all -- a raw
+        pointer the program computed, or an interior address of something
+        the host allocated. Searched newest-first, since the buffer being
+        filled is always the one just made."""
+        for start, end in reversed(fr.allocas):
+            if start <= addr < end:
+                return start
+        return None
+
+    def _release_argbuf(self, fr: Frame, values) -> None:
+        """Drop what a buffer owned, once the call that read it has
+        returned. `values` are the operand values of that call: any of
+        them that IS a buffer base names a buffer whose turn is over.
+
+        AFTER THE CALL, never before -- the callee has had its chance to
+        take a counted reference of its own (a parameter binding, an
+        attribute, a container), so what is released here is only ever
+        the buffer's own.
+        """
+        if not fr.argbuf:
+            return
+        for one in values:
+            # `is int`, because a float operand that happened to equal a
+            # buffer's address would otherwise release it -- an address is
+            # a small integer and a float register holds whatever the
+            # program computed.
+            if type(one) is not int or not one:
+                continue
+            for h in fr.argbuf.pop(one, ()) or ():
+                self.objects.decref(h)
+
+    def _interpreted(self, fn: Function) -> bool:
+        """Whether `_call` will EXECUTE `fn`'s IR rather than hand it to
+        the host object runtime -- the two branches at the top of `_call`,
+        asked ahead of time.
+
+        WHY THIS IS THE LINE `_consume` MAY CROSS. An argument temporary
+        holds a counted reference that nothing retires until the frame
+        ends, so `f(x); del x` left `x` alive for the rest of the run --
+        `__del__` never ran at the moment CPython runs it, and
+        `weakref.ref(x)` went on answering with the object after its last
+        name was gone. Retiring it at the call is only safe if the CALLEE
+        took its own counted reference to anything it keeps, and for an
+        INTERPRETED function that is guaranteed by construction rather
+        than by audit: `_call` increfs every `T.PTR` parameter on entry
+        and decrefs it at teardown, so the value is counted for the whole
+        call, and anything the body keeps past the return it keeps
+        through a path that counts -- an attribute (`_attr_store`), a
+        container (`_apy_seq_push`, `_dict_set`), a global (`Op.STORE`),
+        a closure's cell (`_apy_cell_new`/`_apy_cell_set`), a default
+        (`_apy_func_default`), or by returning it (`protect_handoff`).
+
+        A HOST PRIMITIVE IS NOT COVERED and does not become so here.
+        Those keep the rule they had: nothing is retired for them except
+        the names on `_NON_RETAINING`, whose bodies have actually been
+        read. There are two hundred of them and this is not an audit of
+        two hundred functions -- it is the observation that the ONE
+        function every interpreted call goes through already does the
+        right thing.
+        """
+        if fn.external:
+            return False
+        return not (fn.name.startswith("apy_") and self._objects_own(fn.name))
 
     def _consume(self, fr: Frame, reg: int) -> None:
         """One static read of `reg` -- from `_analyze`'s count -- has just
@@ -763,7 +879,21 @@ class Interpreter:
             return put(_bitcast(a(0), fr.func.register_type(ins.args[0]), ty))
 
         if op is Op.ALLOCA:
-            return put(self.mem.alloc(int(ins.imm)))
+            addr = self.mem.alloc(int(ins.imm))
+            if self.objects is not None and fr.remaining is not None:
+                # ITS EXTENT, so a store into slot 2 of an argument array
+                # can be traced back to the array -- `Op.STORE` only ever
+                # sees the offset address. Recorded for every `alloca`,
+                # not just argument buffers: nothing here can tell them
+                # apart, and one that never receives a handle simply never
+                # gets an entry in `Frame.argbuf`.
+                #
+                # THE SAME GATE `Op.STORE`'s buffer branch has. A function
+                # with a loop has no `remaining` table, so that branch
+                # never runs for it and this list would only grow --
+                # one entry per `alloca` per iteration, read by nothing.
+                fr.allocas.append((addr, addr + max(1, int(ins.imm))))
+            return put(addr)
         if op is Op.LOAD:
             return put(self.mem.read(int(a(0)), ty))
         if op is Op.STORE:
@@ -804,6 +934,31 @@ class Interpreter:
             # locals never reach here regardless (`dynamic.py` gives them
             # a register, written via `Op.COPY` -- see `put()`), so
             # narrowing this to globals loses nothing else.
+            #
+            # THE BUFFER IS AN OWNER TOO, though a short-lived one -- see
+            # `Frame.argbuf`, and the branch below. What was wrong before
+            # was never the incref; it was that nothing released it.
+            if (self.objects is not None and ty is T.PTR
+                    and addr >= self._globals_end and fr.remaining is not None):
+                v = a(0)
+                self.mem.write(addr, ty, v)
+                if v and int(v) in self.objects._refcount:
+                    # OWNERSHIP MOVES from the register to the buffer, so
+                    # the value's count is unchanged across the pair and
+                    # cannot dip through zero in between -- which is the
+                    # whole reason the incref comes first and the register
+                    # is retired second. `apy_call`'s arguments are the
+                    # shape this exists for: `weakref.ref(x)`, `C(x)` and
+                    # `obj.m(x)` all pass through a buffer, and until this
+                    # the register that loaded `x` held a reference until
+                    # the enclosing frame ended -- so `del x` afterwards
+                    # finalized nothing and the weakref went on answering.
+                    base = self._argbuf_base(fr, addr)
+                    if base is not None and self._would_consume(fr, ins.args[0]):
+                        self.objects.incref(int(v))
+                        fr.argbuf.setdefault(base, []).append(int(v))
+                        self._consume(fr, ins.args[0])
+                return None
             if self.objects is not None and ty is T.PTR and addr < self._globals_end:
                 old = self.mem.read(addr, ty)
                 v = a(0)
@@ -832,7 +987,9 @@ class Interpreter:
             callee = self.module.function(ins.sym)
             if callee is None:
                 raise Trap(f"call to unknown function {ins.sym!r}")
-            res = put(self._call(callee, [R[x] for x in ins.args]))
+            args = [R[x] for x in ins.args]
+            res = put(self._call(callee, args))
+            self._release_argbuf(fr, args)
             # See `_NON_RETAINING`: the one narrow exception to the rule
             # below, for calls whose bodies have been READ and keep
             # nothing.
@@ -843,29 +1000,28 @@ class Interpreter:
             callee = self.module.function(ins.sym)
             if callee is None:
                 raise Trap(f"call to unknown function {ins.sym!r}")
-            # NOT ROUTED THROUGH `_consume`, deliberately, even though a
-            # CALL argument that is never read again afterward has the
-            # same "phantom reference until frame teardown" story
-            # `Op.COPY`/`Op.STORE` do -- and once did retire it here.
-            # Reverted: `_consume`'s safety needs the CALLEE to incref
-            # anything it keeps, the way `_attr_store`/`_dict_set`/
-            # `_apy_seq_push` were fixed to. `apy_cell_set` (closures)
-            # was not one of the audited ones -- `def inner(): return
-            # captured` finalized `captured` the moment the closure
-            # captured it, before `inner` was ever called, because
-            # nothing in the cell-store path claimed a reference the way
-            # a list append now does. Two hundred more `apy_*` functions
-            # exist unaudited; retiring an argument here is only safe
-            # for the ones actually checked, and checking all of them
-            # was not -- so nothing here is retired early, and it goes
-            # back to waiting for frame teardown, the same as before
-            # this optimisation existed.
-            return put(self._call(callee, [R[x] for x in ins.args]))
+            args = [R[x] for x in ins.args]
+            res = put(self._call(callee, args))
+            if self.objects is not None:
+                self._release_argbuf(fr, args)
+            if self._interpreted(callee):
+                for reg in ins.args:
+                    self._consume(fr, reg)
+            return res
         if op is Op.CALL_PTR:
             idx = int(a(0)) & ~_FUNC_TAG
-            # See `Op.CALL`'s own comment -- not routed through `_consume`.
-            return put(self._call(self.module.functions[idx],
-                                  [R[x] for x in ins.args[1:]]))
+            callee = self.module.functions[idx]
+            args = [R[x] for x in ins.args[1:]]
+            res = put(self._call(callee, args))
+            if self.objects is not None:
+                self._release_argbuf(fr, args)
+            # See `_interpreted` -- the same rule as `Op.CALL`, and it is
+            # this opcode that carries every call the frontend could not
+            # resolve statically.
+            if self._interpreted(callee):
+                for reg in ins.args[1:]:
+                    self._consume(fr, reg)
+            return res
 
         if op is Op.JUMP:
             return _Jump(ins.labels[0])
@@ -902,26 +1058,46 @@ _ARITH = (Op.ADD, Op.SUB, Op.MUL, Op.DIV, Op.REM, Op.AND, Op.OR, Op.XOR)
 _CMP = (Op.EQ, Op.NE, Op.LT, Op.LE, Op.GT, Op.GE)
 
 #: Object-runtime calls whose ARGUMENT temporaries `_consume` may retire
-#: at their last read -- the one exception to `Op.CALL`'s own comment on
-#: why it does not do that in general.
+#: at their last read. `_interpreted` explains why a call into compiled
+#: Python needs no such list; these are the HOST primitives, which do,
+#: because each one's body is its own answer.
 #:
-#: THE RULE FOR ADDING A NAME: read the whole body and confirm it keeps
-#: NOTHING derived from its arguments -- no store into a list, dict, set,
-#: attribute dict, cell, generator slot or any table on `ObjectHost`
-#: itself -- and that it calls nothing that might. `apy_is`
-#: (`objects_host._apy_is`) is three lines: it dereferences both handles
-#: to validate them, compares the two handle NUMBERS, and answers a bool.
+#: THE RULE FOR ADDING A NAME: read the whole body and confirm that
+#: anything it KEEPS from its arguments, it takes its own counted
+#: reference to -- or that it keeps nothing at all. Not "keeps nothing":
+#: a list that increfs what it appends is exactly as safe, because the
+#: value survives on the list's reference once the register drops its
+#: own. What is NOT safe is a primitive that stashes a value somewhere
+#: uncounted, and retiring the register then finalizes something still
+#: reachable -- the one direction this whole scheme refuses to be wrong
+#: in. Anything unread stays out.
 #:
-#: WHY IT IS WORTH AN EXCEPTION AT ALL: `x is None` is how a program asks
-#: whether something is still there, and `r() is None` is the entire
-#: point of a `weakref` -- the deref's own result temporary, compared
-#: once and never used again, otherwise pinned the very object being
-#: asked about until the frame ended, so `weakref.ref(a)` followed by
-#: `del a` reported the referent as still alive. Every other `apy_*`
-#: name stays out until someone reads its body: guessing wrong here
-#: finalizes something still in use, which is the one direction this
-#: whole scheme refuses to be wrong in.
-_NON_RETAINING = frozenset({"apy_is"})
+#: - `apy_is` keeps nothing: it dereferences both handles to validate
+#:   them, compares the two handle NUMBERS, and answers a bool. It earns
+#:   its place because `x is None` is how a program asks whether
+#:   something is still there, and `r() is None` is the entire point of a
+#:   `weakref` -- the deref's own result temporary, compared once and
+#:   never used again, otherwise pinned the very object being asked
+#:   about until the frame ended.
+#: - `apy_seq_push`, `apy_set_add` and `apy_dict_set` each incref what
+#:   they store (`_apy_seq_push`, `_apy_set_push`, `_dict_set`), which is
+#:   what makes `xs = [Foo()]; xs.clear()` finalize the `Foo` at the
+#:   `clear()` rather than at the end of the enclosing frame.
+#: - `apy_cell_new`/`apy_cell_set` incref what goes in the box, which is
+#:   what made retiring a call argument safe at all -- see
+#:   `Interpreter._interpreted`.
+#:
+#: `apy_setattr` is DELIBERATELY ABSENT even though `_attr_store` counts
+#: correctly: the primitive has several branches -- a data descriptor's
+#: setter, a `__setattr__` override, a `Class` writing a raw field -- and
+#: certifying "counted" means certifying all of them. An attribute-held
+#: value therefore finalizes at frame teardown rather than at the store,
+#: which is late, and late is allowed.
+_NON_RETAINING = frozenset({
+    "apy_is",
+    "apy_seq_push", "apy_set_add", "apy_dict_set",
+    "apy_cell_new", "apy_cell_set",
+})
 
 
 def _arith(op: Op, ty: T.Type, x, y):

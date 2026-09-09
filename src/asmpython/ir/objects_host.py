@@ -66,6 +66,32 @@ NOT_MINE = object()
 #: and False for 257, and a program can see the difference.
 _SMALL_LO, _SMALL_HI = -5, 256
 
+#: What a handle is offset by, so that NO HANDLE CAN EVER EQUAL AN ADDRESS.
+#:
+#: THIS IS NOT COSMETIC. The IR has one `ptr` type for an object handle and
+#: for a raw memory address (a global's, an `alloca`'s), and
+#: `interpreter.py`'s shadow refcounting cannot tell which a `ptr` register
+#: holds -- it just calls `incref`/`decref`, which are no-ops for a number
+#: that is not a live handle. That was safe only while the two numbers could
+#: not collide, and they collided CONSTANTLY: handles used to be indices
+#: counting up from 1, and globals are laid out from address 8 up, so
+#: `ptr.global_addr` handed a register the number 136 in a program whose
+#: 136th object was a live instance.
+#:
+#: The failure was not symmetric, which is why it corrupted rather than
+#: cancelling: writing that address into a register increfs handle 136 only
+#: if 136 is ALREADY a handle, and the address is usually written first --
+#: but the frame's teardown decrefs it unconditionally later, by which time
+#: 136 IS a live object. One spurious decref, and an object with a real
+#: reference still outstanding finalized early. Measured on a cycle whose
+#: members died at their function's return instead of surviving to
+#: `gc.collect()`.
+#:
+#: `1 << 32` sits above any address this interpreter's arena can produce
+#: (`Memory` is `1 << 22` bytes) and below `interpreter._FUNC_TAG`
+#: (`1 << 40`), which tags a function pointer the same way.
+_HANDLE_BASE = 1 << 32
+
 
 def _wrap64(v: int) -> int:
     """An integer as the C's `int64_t` holds it."""
@@ -183,6 +209,9 @@ class ObjectHost:
         self._interp = interp
         # Index 0 is never handed out: a 0 handle is the C's NULL, which means
         # "an error was set" and never a value.
+        #
+        # A HANDLE IS `_HANDLE_BASE + index`, NOT the index itself, and the
+        # offset is load-bearing -- see `_HANDLE_BASE`.
         self._cells: list = [None]
         #: id(object) -> its handle, for the kinds `is` asks about. See
         #: `_value`: the C compares pointers, so one object must be one
@@ -356,20 +385,52 @@ class ObjectHost:
     #: Kinds whose handle is INTERNED, so `is` answers about the object rather
     #: than about which handle it came back through. The mutable containers
     #: are here for the same reason the object kinds are: `xs.append(xs)` then
-    #: `xs[1] is xs` is True in a compiled program. A str or a tuple is left
-    #: out -- compared by value everywhere that matters, and interning them
-    #: would keep every one alive for the run.
-    _INTERNED = (list, dict, set, bytearray, memoryview)
+    #: `xs[1] is xs` is True in a compiled program.
+    #:
+    #: TUPLES AND FROZENSETS WERE LEFT OUT, on the reasoning that they are
+    #: compared by value and that interning would keep every one alive for
+    #: the run. Both halves were wrong. `_cells` already holds a reference
+    #: to every object it mints a handle for, so nothing is freed either
+    #: way -- and value comparison is not the only question asked: `xs =
+    #: [t]` then `xs[0] is t` answered FALSE here and True in CPython,
+    #: because reading the element back minted a SECOND handle for the same
+    #: tuple. Interning by `id(obj)` keeps that correct without making two
+    #: separately built equal tuples the same object.
+    #:
+    #: THE LIFETIME HALF MATTERS MORE. Only an interned kind gets a
+    #: reference count (`_new`), and only a counted kind can hold its
+    #: contents alive: an uncounted tuple neither kept its elements alive
+    #: nor released them, so `return x, y` finalized BOTH before the caller
+    #: ever saw them -- a premature `__del__`, the one direction this
+    #: scheme must never be wrong in. A str is still left out: `is` on one
+    #: is unpredictable in CPython too, and a str holds nothing.
+    _INTERNED = (list, dict, set, frozenset, tuple, bytearray, memoryview)
+
+    def _cell(self, h: int):
+        """The object handle `h` names. The one place the handle-to-index
+        arithmetic lives -- see `_HANDLE_BASE` for why there is any.
+
+        THE LOWER BOUND IS CHECKED, not left to the list: `h` below the
+        base is not a handle at all (a raw address, most likely), and
+        `self._cells[136 - 2**32]` is a large NEGATIVE index, which
+        Python resolves by counting from the END of the list and handing
+        back a real, wrong object rather than raising. `IndexError` is
+        what `_get` above is written to turn into a diagnosis.
+        """
+        i = h - _HANDLE_BASE
+        if i < 0:
+            raise IndexError(h)
+        return self._cells[i]
 
     def _new(self, obj) -> int:
         self._cells.append(obj)
-        made = len(self._cells) - 1
+        made = len(self._cells) - 1 + _HANDLE_BASE
         # RECORDED HERE, not only in `_value`. An object first handed out by
         # `_new` and later reached through `_value` got two handles and
         # compared unequal to itself.
         if isinstance(obj, self._INTERNED) or type(obj).__name__ in (
                 "Instance", "Class", "Exc", "Func", "Gen", "Iterator",
-                "Alias"):
+                "Alias", "Cell"):
             self._identity.setdefault(id(obj), made)
             # BORN AT ZERO. Every INCREF from here is a real, counted
             # reference; nothing after this line double-counts the handle
@@ -508,7 +569,7 @@ class ObjectHost:
         return self._refcount.get(h, -1)
 
     def _finalize(self, h: int) -> None:
-        obj = self._cells[h]
+        obj = self._cell(h)
         if isinstance(obj, Instance):
             m = obj.cls.find("__del__")
             if m is not None and isinstance(m, (Func, Native)):
@@ -541,8 +602,47 @@ class ObjectHost:
                     print(f"Exception ignored in: {obj!r}.__del__\n"
                          f"{kind}: {msg}", file=sys.stderr)
                 self.err, self.err_value = saved_err, saved_val
+        self._fire_weakrefs(h)
+        self._decref_contents(obj)
+
+    def _fire_weakrefs(self, h: int, doomed: frozenset[int] = frozenset()) -> None:
+        """Run every callback registered against `h`, and forget them.
+
+        SPLIT OUT OF `_finalize` so the cycle collector can run this pass
+        FIRST, over the whole garbage set, before it clears any of it --
+        which is the order CPython documents and the order a program can
+        SEE. `gc` "invokes callbacks for objects that would be collected"
+        before it breaks the cycle, so a callback observes a world where
+        the doomed objects are already unreachable but the OTHER members
+        of its own garbage set have not yet been torn apart. Firing them
+        one-at-a-time inside each member's own `_finalize` instead means
+        the first member's `__del__` runs before the second member's
+        callback, and a program counting callbacks during `gc.collect()`
+        sees a different number.
+
+        `doomed` is the rest of the set being collected, if this is a
+        collection: a callback is SKIPPED when its own `ref` is in there
+        too. That is CPython's rule, not a convenience -- `handle_weakrefs`
+        checks `gc_is_collecting` on the weakref itself and clears it
+        without calling, because a callback reachable only from the
+        garbage is about to stop existing and running it would resurrect
+        (or run code out of) a half-dismantled set. Measured, not assumed:
+        a `ref` stored on a cycle member, with a callback, fires zero
+        times under CPython 3.14.
+
+        `pop`, so the loop `_finalize` still reaches is a no-op for a
+        handle the collector already fired: exactly-once either way.
+        """
         for ref_self, callback in self._weakrefs.pop(h, ()):
-            if callback and ref_self not in self._dead:
+            # CLEARED BEFORE THE CALLBACK RUNS, not after: CPython breaks
+            # the weak reference first and calls back second, so a
+            # callback that asks `r()` -- the overwhelmingly common thing
+            # for one to do -- gets `None`. Left in place, `_apy_gc_collect`
+            # would fire callbacks while the target's cell is still
+            # standing (nothing has reached `_dead` yet at that point in
+            # the collection) and `r()` would hand back the doomed object.
+            self._weakref_target.pop(ref_self, None)
+            if callback and ref_self not in self._dead and ref_self not in doomed:
                 # `ref_self not in self._dead`: the weakref OBJECT itself
                 # (a bundled `weakref.ref` instance) is tracked like any
                 # other, and can die before its own target does -- nothing
@@ -564,8 +664,8 @@ class ObjectHost:
                     # handed), and `_invoke` takes host VALUES -- passing
                     # the raw ints reached `f.bound` on an `int` and took
                     # the whole interpreter down with an AttributeError.
-                    self._invoke(self._cells[callback],
-                                 [self._cells[ref_self]])
+                    self._invoke(self._cell(callback),
+                                 [self._cell(ref_self)])
                 except _Trap:
                     raise
                 except _UserFailed:
@@ -578,7 +678,6 @@ class ObjectHost:
                     print(f"Exception ignored in weakref callback\n"
                          f"{kind}: {msg}", file=sys.stderr)
                 self.err, self.err_value = saved_err, saved_val
-        self._decref_contents(obj)
 
     def _referent(self, obj) -> int | None:
         """The handle for `obj`, if `_new` ever minted one for it -- the
@@ -589,50 +688,92 @@ class ObjectHost:
         """
         return self._identity.get(id(obj))
 
+    def _held_by(self, obj):
+        """Every TRACKED handle `obj` holds a reference to.
+
+        ONE DEFINITION, TWO READERS, and they have to agree or the
+        second one is wrong: `_decref_contents` drops exactly these when
+        `obj` is finalized, and `_apy_gc_collect` subtracts exactly
+        these to decide which references are internal to a cycle. A kind
+        walked by one and not the other would make the collector see a
+        count it could not explain.
+
+        Conservative by kind -- anything not listed is a kind this
+        scheme does not track the CONTENTS of yet (`docs/STDLIB.md`
+        names them), and is left alone rather than guessed at: missing
+        one leaks a shadow count (safe), inventing one finalizes
+        something still alive.
+
+        A TUPLE OR FROZENSET IS WALKED THROUGH, not reported: neither is
+        interned, so `_new` never gave it a handle of its own (see
+        `_INTERNED`) and there is nothing to count against it -- but it
+        can still be HOLDING something tracked, and `xs = [(Foo(),)]`
+        has to reach that `Foo` when `xs` dies.
+        """
+        out = []
+
+        def walk(v):
+            h = self._referent(v)
+            if h is not None:
+                out.append(h)
+            elif isinstance(v, (tuple, frozenset)):
+                for item in v:
+                    walk(item)
+
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            # LAST ELEMENT FIRST, because the order several objects
+            # dying together are finalized in is observable and this is
+            # the order CPython's own `list_dealloc` uses -- it walks the
+            # item array backwards. Measured: a list of three, and a
+            # comprehension's three results, both printed in reverse
+            # there and forward here until this. A `set`'s order is its
+            # own business in both, and a dict's entries stay forward,
+            # which is the order CPython's dict teardown takes them in.
+            for item in reversed(list(obj)):
+                walk(item)
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                walk(k)
+                walk(v)
+        elif isinstance(obj, Instance):
+            for v in obj.dict.values():
+                walk(v)
+            if obj.held is not None:
+                out.extend(self._held_by(obj.held))
+        elif isinstance(obj, Cell):
+            # A CLOSURE'S BOX HOLDS WHAT IS IN IT. Counted since
+            # `_apy_cell_new`/`_apy_cell_set` began increfing, and this is
+            # the matching drop -- without it the cell's reference would be
+            # one nothing ever released, and `x = Foo(); def f(): return x`
+            # would keep `Foo` alive for the rest of the run even after both
+            # the name and the closure were gone.
+            walk(obj.slot)
+        # NOT `Func`, though a function plainly HOLDS its closure's cells
+        # and its defaults, and both are increfed where they are attached
+        # (`_apy_func_cell`, `_apy_func_default`). Reporting them here
+        # cascades on a function's own finalization, and A FUNCTION'S
+        # COUNT IS NOT MAINTAINED WELL ENOUGH TO CASCADE FROM: a closure
+        # reaches `_invoke_obj` as the `env` argument, which pins it and
+        # then unpins -- and that unpin found the count at zero and
+        # finalized `inner` after each call to it, dropping the cell,
+        # dropping the captured object, and printing `captured died`
+        # while the closure that captured it was still being called.
+        # Measured on exactly that program. So the increfs stay (they are
+        # what makes retiring a call argument safe -- see
+        # `interpreter.py`'s `_interpreted`) and the matching drop does
+        # not: a closed-over value outlives its closure here, which is
+        # LATE, and late is the direction this scheme is allowed to be
+        # wrong in. `docs/STDLIB.md` records it.
+        return out
+
     def _decref_contents(self, obj) -> None:
         """The cascade: dropping the last reference to a container drops
         one reference to everything it was holding, exactly as CPython's
         `tp_dealloc` walks a `list`/`dict`/instance `__dict__` on the way
-        down. Conservative by kind -- anything not listed here is a kind
-        this scheme does not track the CONTENTS of yet (see
-        `docs/STDLIB.md`'s coverage note for this feature), and is left
-        alone rather than guessed at: under-decrefing leaks a shadow count
-        forever (this object simply never reaches zero through this path),
-        which is the safe direction to be wrong in -- over-decrefing would
-        finalize something still alive.
+        down. `_held_by` says what "everything it was holding" means.
         """
-        if isinstance(obj, (list, tuple, set, frozenset)):
-            for item in obj:
-                h = self._referent(item)
-                if h is not None:
-                    self.decref(h)
-                elif isinstance(item, (tuple, frozenset)):
-                    # A TUPLE/FROZENSET HAS NO HANDLE OF ITS OWN to
-                    # decref (see `_INTERNED`'s own comment -- neither
-                    # is interned), so `_referent` never finds one here
-                    # even though it may still be holding something that
-                    # DOES: `xs = [(Foo(),)]` finalizing nothing when
-                    # `xs` dies. Walked directly rather than through
-                    # `decref`, since there is no handle to call it on.
-                    self._decref_contents(item)
-        elif isinstance(obj, dict):
-            for k, v in obj.items():
-                hk, hv = self._referent(k), self._referent(v)
-                if hk is not None:
-                    self.decref(hk)
-                elif isinstance(k, (tuple, frozenset)):
-                    self._decref_contents(k)
-                if hv is not None:
-                    self.decref(hv)
-                elif isinstance(v, (tuple, frozenset)):
-                    self._decref_contents(v)
-        elif isinstance(obj, Instance):
-            for v in obj.dict.values():
-                h = self._referent(v)
-                if h is not None:
-                    self.decref(h)
-            if obj.held is not None:
-                self._decref_contents(obj.held)
+        for h in self._held_by(obj):
+            self.decref(h)
 
     def _get(self, h, where: str):
         h = int(h)
@@ -642,7 +783,7 @@ class ObjectHost:
                 f"failed and its result was used without checking "
                 f"apy_error_occurred()")
         try:
-            return self._cells[h]
+            return self._cell(h)
         except IndexError:
             raise _Trap(f"{where}: {h} is not a runtime value handle") from None
 
@@ -692,7 +833,7 @@ class ObjectHost:
         if isinstance(obj, int):
             return self._int(obj)
         if isinstance(obj, (Instance, Class, Exc, Func, Gen, Iterator,
-                            list, dict, set, Alias)):
+                            list, dict, set, frozenset, tuple, Alias, Cell)):
             # ONE HANDLE PER OBJECT, so `is` answers about the object and not
             # about which handle it came back through. The C compares
             # pointers, so a fresh handle for the same instance made
@@ -705,8 +846,19 @@ class ObjectHost:
             # an element minted a second handle for the same list. Only the
             # mutable ones: a str or a tuple is compared by value everywhere
             # that matters, and interning them would keep every one alive.
+            #
+            # AND A CELL, which no program can see but which `apy_env_cell`
+            # hands back on every call into a closure. A second handle for
+            # the same box gets its OWN entry in `_refcount`, starting at
+            # zero: the callee's register increfed that one to 1 and its
+            # teardown dropped it to 0, which finalized the box -- and now
+            # that `_held_by` walks a Cell's slot, that dropped the CAPTURED
+            # VALUE. `def inner(): print(captured.name)` printed
+            # `captured died` between two calls to `inner`, with `inner`
+            # still holding it. Interning is what makes the box's count one
+            # count.
             got = self._identity.get(id(obj))
-            if got is not None and self._cells[got] is obj:
+            if got is not None and self._cell(got) is obj:
                 return got
             made = self._new(obj)
             self._identity[id(obj)] = made
@@ -2759,20 +2911,19 @@ def _apy_seq_push(h, a):
     seq = h._get(a[0], "apy_seq_push")
     item = h._get(a[1], "apy_seq_push")
     if isinstance(seq, tuple):
-        # NO INCREF FOR A TUPLE, unlike the list below, and the asymmetry
-        # is forced: a tuple handle is not refcount-tracked at all (see
-        # `_INTERNED` -- tuples are deliberately not interned, so `_new`
-        # never gives one a `_refcount` entry and `_referent` never finds
-        # one), which means nothing ever decrefs a tuple, which means an
-        # incref here would have no counterpart ANYWHERE and would pin
-        # every element of every tuple for the run. Measured: with it,
-        # `a, b = self(), other()` -- an ordinary unpacking, which builds
-        # a tuple -- permanently pinned both values, and a `weakref`'s
-        # own `__eq__` stopped its referents from ever dying. The
-        # consequence of leaving it out is the opposite gap, documented
-        # in `docs/STDLIB.md`: an object held ONLY by a tuple is not kept
-        # alive by it.
-        h._cells[int(a[0])] = seq + (item,)
+        # THE CELL IS REPLACED, so the IDENTITY TABLE HAS TO MOVE WITH IT.
+        # A tuple is interned by `id(obj)` (see `_INTERNED`), and the old
+        # tuple is unreferenced the moment this line runs -- CPython is
+        # free to free it and hand its `id` to something else, which
+        # would then resolve to THIS handle. Popping the old entry and
+        # adding the new one is what keeps that from happening.
+        made = seq + (item,)
+        h._cells[int(a[0]) - _HANDLE_BASE] = made
+        h._identity.pop(id(seq), None)
+        h._identity[id(made)] = int(a[0])
+        # The tuple holds a reference now, like the list below, and
+        # `_held_by` releases it when the tuple itself reaches zero.
+        h.incref(int(a[1]))
         return h._none
     if not isinstance(seq, list):
         return h._fail(
@@ -5932,7 +6083,25 @@ for _op in ("neg", "pos", "invert"):
 # ── the entry points ────────────────────────────────────────────────────────
 
 def _apy_cell_new(h, a):
-    return h._new(Cell(h._get(a[0], "apy_cell_new")))
+    """A CELL COUNTS WHAT IS IN IT, exactly as a list counts its elements.
+
+    A closure's box is the one place a value could be RETAINED without
+    anything counting it, and that made it the one place the interpreter
+    could not retire a call argument at its last read -- see
+    `ir/interpreter.py`'s `_consume`. `def outer(o): def inner(): return o`
+    keeps `o` alive through `inner`, with nothing but this cell holding it
+    once `outer`'s frame is gone; without the incref here, retiring the
+    CALLER's temporary finalized `o` while `inner` still closed over it.
+
+    The matching decref is `_held_by`/`_decref_contents`: a Cell reports
+    its slot, so the whole cascade -- finalization order, the cycle
+    collector's subtraction -- treats it like any other container.
+    """
+    v = h._get(a[0], "apy_cell_new")
+    held = h._referent(v)
+    if held is not None:
+        h.incref(held)
+    return h._new(Cell(v))
 
 
 def _apy_cell_get(h, a):
@@ -5940,7 +6109,17 @@ def _apy_cell_get(h, a):
 
 
 def _apy_cell_set(h, a):
-    h._get(a[0], "apy_cell_set").slot = h._get(a[1], "apy_cell_set")
+    """Rebinding a closed-over variable. NEW BEFORE OLD, and see
+    `_apy_cell_new` for why either happens at all."""
+    cell = h._get(a[0], "apy_cell_set")
+    v = h._get(a[1], "apy_cell_set")
+    old = h._referent(cell.slot)
+    held = h._referent(v)
+    cell.slot = v
+    if held is not None:
+        h.incref(held)
+    if old is not None and old != held:
+        h.decref(old)
     return h._none
 
 
@@ -5957,8 +6136,16 @@ def _apy_func_new(h, a):
 
 
 def _apy_func_default(h, a):
+    """`def f(x=<value>)` -- the default lives on the FUNCTION, so the
+    function holds a reference to it. Counted, and dropped by
+    `_held_by(Func)`; a default is written once, at the `def`, so there is
+    no old value to release."""
     f = h._get(a[0], "apy_func_default")
-    f.defaults[int(a[1])] = h._get(a[2], "apy_func_default")
+    v = h._get(a[2], "apy_func_default")
+    held = h._referent(v)
+    if held is not None:
+        h.incref(held)
+    f.defaults[int(a[1])] = v
     return a[0]
 
 
@@ -6002,8 +6189,17 @@ def _apy_func_param(h, a):
 
 
 def _apy_func_cell(h, a):
+    """Attach one of the closure's boxes. THE FUNCTION HOLDS THE CELL, and
+    the cell holds the value (`_apy_cell_new`) -- that chain is what keeps a
+    captured variable alive for exactly as long as some closure over it is,
+    and no longer. Dropped by `_held_by(Func)`; attached once, at the `def`,
+    so there is no old cell to release."""
     f = h._get(a[0], "apy_func_cell")
-    f.cells[int(a[1])] = h._get(a[2], "apy_func_cell")
+    cell = h._get(a[2], "apy_func_cell")
+    held = h._referent(cell)
+    if held is not None:
+        h.incref(held)
+    f.cells[int(a[1])] = cell
     return a[0]
 
 
@@ -9095,6 +9291,123 @@ def _apy_weakref_existing(h, a):
 
 
 _TABLE["apy_weakref_existing"] = _apy_weakref_existing
+
+
+def _apy_gc_collect(h, a):
+    """`gc.collect()` -- find every object kept alive ONLY by a cycle,
+    finalize it, and answer how many there were.
+
+    CPYTHON'S OWN ALGORITHM, and it needs nothing this scheme does not
+    already have -- in particular it never asks what the interpreter's
+    frames are holding, which is the part `ObjectHost` cannot see:
+
+    1. Take every tracked, still-live handle as a CANDIDATE, and give
+       each a scratch count starting at its real reference count.
+    2. For each candidate, walk what it HOLDS (`_held_by`) and subtract
+       one from each held candidate's scratch count. That removes
+       exactly the references candidates make to each other.
+    3. A candidate whose scratch count is still above zero is referenced
+       from OUTSIDE the candidate set -- a register, a global, a
+       container that is itself externally held. It is reachable, and so
+       is everything reachable FROM it.
+    4. Whatever is left is reachable only from inside the set: a cycle,
+       or something hanging off one. That is the garbage.
+
+    WHY THIS IS THE MECHANISM CPYTHON HAS TOO, rather than an extra one
+    bolted on: plain reference counting cannot collect a cycle, because
+    every member's count is held up by another member -- which is why
+    `gc.collect()` exists there at all, and why a program that never
+    calls it sees a cycle survive in both.
+
+    BEING WRONG HERE IS BEING TOO CONSERVATIVE. Every count this scheme
+    over-holds (`docs/STDLIB.md` lists them -- a temporary passed into a
+    call, a closure cell) makes a member look externally referenced, so
+    its cycle is left alone. Nothing is collected that should not be;
+    some things are not collected that could be.
+    """
+    del a
+    scratch = {c: h._refcount[c] for c in h._refcount
+               if c not in h._dead and h._refcount[c] > 0}
+    held = {c: h._held_by(h._cell(c)) for c in scratch}
+    for owner in scratch:
+        for one in held[owner]:
+            if one in scratch:
+                scratch[one] -= 1
+    reachable = {c for c in scratch if scratch[c] > 0}
+    stack = list(reachable)
+    while stack:
+        for one in held[stack.pop()]:
+            if one in scratch and one not in reachable:
+                reachable.add(one)
+                stack.append(one)
+    garbage = [c for c in scratch if c not in reachable]
+    doomed = frozenset(garbage)
+    for one in garbage:
+        # EVERY CALLBACK IN THE SET, BEFORE ANY OF THE SET IS TORN DOWN.
+        # CPython's collector clears the weak references to an
+        # unreachable set and runs their callbacks as one pass, and only
+        # then finalizes and clears the members -- so a callback sees the
+        # whole cycle still assembled, and a program counting callbacks
+        # during `gc.collect()` counts all of them. Leaving each
+        # member's callbacks to its own `_finalize` interleaves them with
+        # the `__del__`s instead, and a callback whose own `ref` is a
+        # member of the same set can find itself already dead (and so
+        # never fire) by the time its turn comes.
+        h._fire_weakrefs(one, doomed)
+    for one in garbage:
+        # `_finalize_once`, not `decref`: their counts are held up by
+        # each other and will never reach zero on their own -- deciding
+        # they are garbage IS the collection. The `_dead` latch keeps
+        # the cascade from finalizing a member twice when one member's
+        # own teardown reaches another.
+        h._finalize_once(one)
+    return h._int(len(garbage))
+
+
+_TABLE["apy_gc_collect"] = _apy_gc_collect
+
+
+def _apy_sys_getrefcount(h, a):
+    """`sys.getrefcount(obj)` -- the shadow count, plus one.
+
+    MINUS ONE, and the one being subtracted is this runtime's, not the
+    program's. A `("call", ...)` member of `sys` is materialized as a
+    callable value, so reaching this primitive goes through a generated
+    wrapper frame (`pyn_apy_sys_getrefcount`) that BINDS the argument --
+    one counted reference, held for exactly the length of a call the
+    program did not write and cannot see. Subtracting it answers about
+    the program's own bindings, which is what the question means and
+    what CPython 3.14 answers: `x = Foo(); sys.getrefcount(x)` is 1
+    there, and is 1 here.
+
+    (CPython's older convention of answering one HIGHER, for the
+    argument its own C function receives, is gone in 3.14 -- checked
+    against the installed interpreter rather than assumed from the
+    docs, which still describe the old behaviour.)
+
+    ONE SHAPE READS ONE HIGHER HERE, and it is worth naming rather than
+    leaving to be discovered: a function asking about its OWN PARAMETER.
+    `def f(o): return sys.getrefcount(o)` called with a caller's local
+    answers 1 in CPython 3.14 and 2 here, because that binding IS a
+    counted reference in this runtime and CPython's interpreter borrows
+    it from the caller's frame instead. Every reference a PROGRAM makes
+    -- a name, a list or set membership, a dict value, an attribute --
+    is counted identically in both; the difference is confined to a
+    reference that exists only because a call is in progress, which is
+    an interpreter's own bookkeeping and is exactly the part CPython's
+    own documentation warns is implementation-specific.
+
+    `0` for a handle this scheme never tracked (a plain int or str --
+    see `_refcount`'s own comment). CPython answers a large number for
+    those, since it really does count references to interned scalars;
+    nothing here can, and `0` is the honest "not counted" rather than a
+    number made up to look like one.
+    """
+    n = h.refcount(int(a[0]))
+    return h._int(max(0, n - 1) if n >= 0 else 0)
+
+
+_TABLE["apy_sys_getrefcount"] = _apy_sys_getrefcount
 
 
 def _apy_weakref_count(h, a):

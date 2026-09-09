@@ -285,7 +285,7 @@ OBJECT_RUNTIME = _object_runtime()
 #: that has to stay true for every name added to this set.
 _OBJRT_DYNAMIC_NAMES = frozenset({
     "apy_weakref_register", "apy_weakref_deref", "apy_weakref_count",
-    "apy_weakref_existing",
+    "apy_weakref_existing", "apy_gc_collect",
 })
 assert _OBJRT_DYNAMIC_NAMES <= OBJECT_RUNTIME.keys()
 assert all(all(t is PTR for t in args) and ret is PTR

@@ -48,8 +48,17 @@ def run_text(src: str, tmp_path) -> tuple[list[str], int]:
 #: the point is not which one, but that the compiler reports rather than dies.
 UNSUPPORTED = [
     "class C: pass",
-    "import os",
-    "from os import path",
+    # NOT `import os` / `from os import path`: `os` is one of the BUNDLED
+    # modules (`frontends/python/bundled/`), and importing one of those has
+    # always been accepted -- the splice drops the statement and the
+    # definitions come in under mangled names. It was listed here because
+    # the splice only scanned MODULE-LEVEL statements, so the identical
+    # import one line further in, inside `main`, survived to be denied by
+    # `E0083` -- naming `os` in its own "available:" list while doing so.
+    # A module that is genuinely not available (`import socket`) is still
+    # rejected, at either depth, which is what this list is for.
+    "import socket",
+    "from socket import socket",
     "x = [1, 2, 3]",
     "x = {1: 2}",
     "x = (1, 2)",

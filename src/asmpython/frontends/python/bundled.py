@@ -414,7 +414,27 @@ def splice(tree: ast.Module, source, sink) -> ast.Module:
     if uses:
         at = at or next((n for n in ast.walk(tree)
                          if isinstance(n, ast.Name) and n.id in uses), None)
-    for stmt in tree.body:
+    # `ast.walk`, NOT `tree.body`: an `import` INSIDE A FUNCTION is the same
+    # import. The scan was module-level only, so
+    #
+    #     def f():
+    #         import heapq
+    #
+    # never made `heapq` wanted, nothing was spliced, the statement survived
+    # into analysis and came back `E0083: no module named 'heapq' is
+    # available` -- with `heapq` listed in that same diagnostic's own
+    # "available:" line, which is as self-contradicting as a compiler gets.
+    # A builtin module (`math`) worked there all along, so the gap was
+    # invisible until a bundled one was tried.
+    #
+    # NOTHING DOWNSTREAM NEEDS THE DISTINCTION. A splice has no scoping to
+    # respect: what it produces is module-level definitions under mangled
+    # names, and `_Rewrite` already walks into function bodies to repoint the
+    # references. Hoisting the DEFINITIONS out of the function that imported
+    # them is what CPython effectively does too -- the module object is built
+    # once and cached in `sys.modules`, and a function-level `import` after
+    # the first is a dictionary lookup.
+    for stmt in ast.walk(tree):
         if isinstance(stmt, ast.Import):
             for alias in stmt.names:
                 if alias.name in have:
@@ -541,47 +561,71 @@ def splice(tree: ast.Module, source, sink) -> ast.Module:
     # `from functools import reduce` REWRITES the user's spelling to the
     # spliced definition rather than binding a variable to it.
     names = {}
-    kept = []
-    for stmt in tree.body:
-        if isinstance(stmt, ast.Import) \
-                and all(a.name in have for a in stmt.names):
-            # THE IMPORT SURVIVES when the module also exists as a builtin
-            # one: `sys` is bundled IN PART -- `audit` and `monitoring` are
-            # ordinary Python while `maxsize` is a compiler constant -- and
-            # dropping the statement unbound the half this does not cover.
-            also = [a for a in stmt.names if _resolve(a.name) is not None]
-            if also:
-                kept.append(ast.copy_location(ast.Import(names=also), stmt))
-            continue
-        if isinstance(stmt, ast.ImportFrom) and stmt.module in have:
-            left = []
-            for alias in stmt.names:
-                if alias.name not in members[stmt.module]:
-                    # NOT SOMETHING THE BUNDLED MODULE DEFINES, so the import
-                    # of it SURVIVES -- WHEN THERE IS SOMETHING ELSE TO SURVIVE
-                    # INTO. A module can be bundled IN PART -- `typing`'s
-                    # special forms are already runtime values and only its
-                    # classes need writing -- and dropping the whole statement
-                    # unbound the half this does not cover.
-                    #
-                    # When nothing else provides the module, leaving the
-                    # statement handed analysis an import it could not resolve
-                    # and produced a diagnostic denying the module exists. See
-                    # `_no_member`.
-                    if _resolve(stmt.module) is None:
-                        _no_member(sink, source, stmt, stmt.module,
-                                   alias.name, members)
+
+    def without_bundled(body: list) -> list:
+        """`body` with its bundled imports dropped, or trimmed to the half
+        this does not cover. Whatever `from ... import` bound is recorded in
+        `names` for `_Rewrite` to repoint."""
+        out = []
+        for stmt in body:
+            if isinstance(stmt, ast.Import) \
+                    and all(a.name in have for a in stmt.names):
+                # THE IMPORT SURVIVES when the module also exists as a builtin
+                # one: `sys` is bundled IN PART -- `audit` and `monitoring` are
+                # ordinary Python while `maxsize` is a compiler constant -- and
+                # dropping the statement unbound the half this does not cover.
+                also = [a for a in stmt.names if _resolve(a.name) is not None]
+                if also:
+                    out.append(ast.copy_location(ast.Import(names=also), stmt))
+                continue
+            if isinstance(stmt, ast.ImportFrom) and stmt.module in have:
+                left = []
+                for alias in stmt.names:
+                    if alias.name not in members[stmt.module]:
+                        # NOT SOMETHING THE BUNDLED MODULE DEFINES, so the
+                        # import of it SURVIVES -- WHEN THERE IS SOMETHING ELSE
+                        # TO SURVIVE INTO. A module can be bundled IN PART --
+                        # `typing`'s special forms are already runtime values
+                        # and only its classes need writing -- and dropping the
+                        # whole statement unbound the half this does not cover.
+                        #
+                        # When nothing else provides the module, leaving the
+                        # statement handed analysis an import it could not
+                        # resolve and produced a diagnostic denying the module
+                        # exists. See `_no_member`.
+                        if _resolve(stmt.module) is None:
+                            _no_member(sink, source, stmt, stmt.module,
+                                       alias.name, members)
+                            continue
+                        left.append(alias)
                         continue
-                    left.append(alias)
-                    continue
-                names[alias.asname or alias.name] = _mangled(stmt.module,
-                                                             alias.name)
-            if left:
-                kept.append(ast.copy_location(
-                    ast.ImportFrom(module=stmt.module, names=left,
-                                   level=stmt.level), stmt))
-            continue
-        kept.append(stmt)
+                    names[alias.asname or alias.name] = _mangled(stmt.module,
+                                                                 alias.name)
+                if left:
+                    out.append(ast.copy_location(
+                        ast.ImportFrom(module=stmt.module, names=left,
+                                       level=stmt.level), stmt))
+                continue
+            out.append(stmt)
+        return out
+
+    kept = without_bundled(tree.body)
+    # AND EVERY NESTED BODY, for the same reason the collection above walks
+    # the whole tree: `def f(): import heapq` is an import of a bundled
+    # module, and leaving the statement in place hands analysis one it cannot
+    # resolve. Function bodies, class bodies, `if`/`try`/`with`/loop bodies --
+    # anything holding statements, at any depth.
+    #
+    # Mutating during `ast.walk` is safe here because what is REMOVED is only
+    # ever an `Import` or `ImportFrom`, and neither holds statements of its
+    # own: a dropped node the walk has already queued contributes nothing when
+    # its turn comes.
+    for stmt in kept:
+        for child in ast.walk(stmt):
+            for field, value in ast.iter_fields(child):
+                if isinstance(value, list) and any(
+                        isinstance(one, ast.stmt) for one in value):
+                    setattr(child, field, without_bundled(value))
 
     # `warnings.deprecated` WHERE `warnings` IS BUNDLED AND HAS NO SUCH NAME.
     # Reported HERE, before `_Rewrite` runs, because afterwards the attributes

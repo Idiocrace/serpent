@@ -1203,6 +1203,26 @@ APY_API apy_value apy_weakref_existing(apy_value target) {
                     "build keeps no reference count to weaken against");
 }
 
+/* `gc.collect()`. Same interpreter-only story: finding a cycle means
+   subtracting the references its members make to each other from their
+   reference COUNTS, and this build keeps none. Refusing rather than
+   answering 0, which would read as "nothing was collectable" -- a
+   plausible number, and a false one. */
+/* `sys.getrefcount(obj)`. Interpreter-only for the same reason as the
+   two above: there is no reference count in a compiled build to report. */
+APY_API apy_value apy_sys_getrefcount(apy_value v) {
+    (void)v;
+    return apy_fail("NotImplementedError",
+                    "sys.getrefcount() needs the reference interpreter -- a "
+                    "compiled build keeps no reference count to report");
+}
+
+APY_API apy_value apy_gc_collect(void) {
+    return apy_fail("NotImplementedError",
+                    "gc.collect() needs the reference interpreter -- a "
+                    "compiled build keeps no reference count to collect by");
+}
+
 /* `round` is round-HALF-TO-EVEN, which C's `round` is not: C rounds half away
    from zero, so it answers 3 for round(2.5) where Python answers 2. And
    `round(x)` with no digits returns an INT. */

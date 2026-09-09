@@ -236,7 +236,7 @@ _HOSTSVC_NAMES = frozenset(_hostsvc_names())
 #: needs a new one, the same way `weakref.py` needed these two.
 _OBJRT_DYNAMIC_NAMES = frozenset({
     "apy_weakref_register", "apy_weakref_deref", "apy_weakref_count",
-    "apy_weakref_existing",
+    "apy_weakref_existing", "apy_gc_collect",
 })
 
 _BUILTIN_TYPE_VALUES = frozenset({

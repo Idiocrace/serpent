@@ -190,6 +190,10 @@ _SYS = {
     "maxsize": ("int", 2 ** 63 - 1),
     "byteorder": ("str", "little"),
     "platform": ("str", "asmpython"),
+    # INTERPRETER-ONLY, like `weakref` and `gc`: it reads the shadow
+    # reference count `ir/objects_host.py` keeps, which a compiled build
+    # does not have, so `apy_sys_getrefcount` refuses BY NAME there.
+    "getrefcount": ("call", "apy_sys_getrefcount", 1),
 }
 
 BUILTIN_MODULES = {
