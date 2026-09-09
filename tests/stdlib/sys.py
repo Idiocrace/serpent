@@ -94,3 +94,52 @@ def calls_leave_nothing():
 
 calls_leave_nothing()
 print("done")
+
+
+# --- the bundled half: streams, breakpoint, audit, monitoring ---------
+print("stdout writable:", sys.stdout.writable(), sys.stdout.readable(),
+      sys.stdout.seekable())
+print("descriptors:", sys.stdout.fileno(), sys.stderr.fileno())
+print("closed/isatty:", sys.stdout.closed, sys.stdout.isatty(),
+      sys.stdout.flush())
+try:
+    sys.stdout.write(7)
+except TypeError as exc:
+    print("write type:", exc)
+
+calls = []
+sys.breakpointhook = lambda *a, **kw: calls.append((a, sorted(kw)))
+breakpoint()
+breakpoint(1, k=2)
+print("breakpoint:", calls, callable(breakpoint))
+
+seen = []
+sys.addaudithook(lambda event, args: seen.append((event, args)))
+sys.audit("stdlib.test", 1, "two")
+sys.audit("stdlib.other")
+print("audit:", seen, callable(sys.audit), callable(sys.addaudithook))
+
+mon = sys.monitoring
+print("ids:", mon.DEBUGGER_ID, mon.COVERAGE_ID, mon.PROFILER_ID,
+      mon.OPTIMIZER_ID)
+print("events:", mon.events.NO_EVENTS, mon.events.PY_START, mon.events.CALL,
+      mon.events.LINE, mon.events.BRANCH)
+print("unclaimed:", mon.get_tool(mon.DEBUGGER_ID))
+mon.use_tool_id(mon.DEBUGGER_ID, "stdlib")
+print("claimed:", mon.get_tool(mon.DEBUGGER_ID))
+try:
+    mon.use_tool_id(mon.DEBUGGER_ID, "again")
+except ValueError as exc:
+    print("reuse:", exc)
+print("events before:", mon.get_events(mon.DEBUGGER_ID))
+mon.set_events(mon.DEBUGGER_ID, mon.events.CALL | mon.events.LINE)
+print("events after:", mon.get_events(mon.DEBUGGER_ID))
+print("callback:", mon.register_callback(mon.DEBUGGER_ID, mon.events.CALL,
+                                         lambda *a: None))
+mon.free_tool_id(mon.DEBUGGER_ID)
+print("freed:", mon.get_tool(mon.DEBUGGER_ID))
+for bad in (9, -1):
+    try:
+        mon.get_tool(bad)
+    except ValueError as exc:
+        print("bad id:", exc)
