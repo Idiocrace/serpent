@@ -995,15 +995,7 @@ class ObjectHost:
                         return got
             return f"<class '{v.name}'>"
         if isinstance(v, Alias):
-            # THE UNION IS THE ONLY FORM THAT PRINTS WITH BARS. PEP 604 made
-            # `int | str` the spelling for that one; every other form keeps
-            # the subscript it was written with, and testing "the origin is an
-            # instance" made `Annotated[int, 'x']` print as a union.
-            if _form_name(v.origin) == "Union":
-                return " | ".join(_alias_part(x) for x in v.args)
-            # `list[int]`, not `list[<class 'int'>]` -- see `_alias_part`.
-            inner = ", ".join(_alias_part(x) for x in v.args)                 if isinstance(v.args, (list, tuple)) else _alias_part(v.args)
-            return f"{_alias_part(v.origin)}[{inner}]"
+            return _alias_text(v)
         if isinstance(v, Func):
             # A BUILTIN TYPE NAME PRINTS AS A CLASS. `print(int)` says
             # `<class 'int'>` and it reaches here as a callable thunk, so the
@@ -3940,16 +3932,47 @@ def _apy_typing_form(h, a):
     return made
 
 
+#: What a parameterised type answers `get_origin`/`get_args` from when it is
+#: NOT the native alias kind -- see `_apy_get_origin`.
+_ALIAS_ATTR = ("__origin__", "__args__")
+
+
+def _generic_attr(h, a, which: str, empty):
+    """The `__origin__`/`__args__` a PYTHON OBJECT carries.
+
+    `typing.Generic`'s own `__class_getitem__` is written in Python -- see
+    `bundled/typing.py` -- so `Box[int]` is an ordinary instance and not the
+    alias kind `list[int]` builds. Both spellings answer the same two
+    attributes, so reading the attribute covers the user generic without
+    changing a single answer for the builtin one, which is what makes this
+    worth doing here rather than rewriting the two functions in the bundled
+    module (where every program that only wants `get_origin` would pay for
+    the whole of `typing`).
+
+    A MISS IS NOT AN ERROR: `get_origin(3)` is None in CPython, not a
+    TypeError, and every library that probes an annotation relies on it.
+    """
+    return _apy_getattr_default(h, [a[0], h._new(which), empty])
+
+
 def _apy_get_origin(h, a):
     """`get_origin(x)` -- what was subscripted, or None."""
     v = h._get(a[0], "apy_get_origin")
-    return h._value(v.origin) if isinstance(v, Alias) else h._none
+    if isinstance(v, Alias):
+        return h._value(v.origin)
+    if isinstance(v, Instance):
+        return _generic_attr(h, a, _ALIAS_ATTR[0], h._none)
+    return h._none
 
 
 def _apy_get_args(h, a):
     """`get_args(x)` -- what it was subscripted WITH, or the empty tuple."""
     v = h._get(a[0], "apy_get_args")
-    return h._new(tuple(v.args) if isinstance(v, Alias) else ())
+    if isinstance(v, Alias):
+        return h._new(tuple(v.args))
+    if isinstance(v, Instance):
+        return _generic_attr(h, a, _ALIAS_ATTR[1], h._new(()))
+    return h._new(())
 
 
 def _apy_typing_final(h, a):
@@ -5189,18 +5212,30 @@ def _reject(h, sym: str, x, y):
 
 def _is_type_like(v) -> bool:
     """Is this something `|` should read as a TYPE? A builtin type used as a
-    value, a user class, `None`, or a union already built from either."""
+    value, a user class, `None`, or ANY parameterised type.
+
+    ANY ALIAS, not only a union: `list[int] | None` and
+    `Annotated[str, 'o'] | None` are both ordinary unions in CPython, and
+    requiring the origin to be a `typing` special form refused the first and
+    mis-read the second.
+    """
     if isinstance(v, Func) and getattr(v, "is_type", False):
         return True
     if isinstance(v, Class) or v is None:
         return True
-    return isinstance(v, Alias) and isinstance(v.origin, Instance)
+    return isinstance(v, Alias)
 
 
 def _union_arms(v) -> list:
     """`v`'s arms. A union contributes its own rather than itself, so unions
-    flatten instead of nesting."""
-    if isinstance(v, Alias) and isinstance(v.origin, Instance):
+    flatten instead of nesting.
+
+    ONLY A UNION FLATTENS. Every `typing` special form has an `Instance`
+    origin, so testing for one flattened `Annotated[str, 'o']` too and
+    `Optional[Annotated[str, 'o']]` came out as `str | 'o' | None` -- the
+    metadata promoted to an arm of the union.
+    """
+    if isinstance(v, Alias) and _form_name(v.origin) == "Union":
         return list(v.args)
     # `None` IN A UNION IS `NoneType`. `int | None` is written with the VALUE
     # and holds the TYPE -- `get_args` answers `<class 'NoneType'>` in
@@ -8660,6 +8695,26 @@ class Alias:
         return hash((id(self.origin), self.args))
 
 
+def _alias_text(v) -> str:
+    """`list[int]`, `int | str`, `typing.Annotated[int, 'm']` -- a whole alias.
+
+    THE UNION IS THE ONLY FORM THAT PRINTS WITH BARS. PEP 604 made `int | str`
+    the spelling for that one; every other form keeps the subscript it was
+    written with, and testing "the origin is an instance" made
+    `Annotated[int, 'x']` print as a union.
+
+    AT MODULE LEVEL rather than inside `_text`, because `_alias_part` below
+    has to reach it for a NESTED one: `list[Annotated[int, 'n']]` printed the
+    inner alias through `repr()`, which is this file's own object address.
+    """
+    if _form_name(v.origin) == "Union":
+        return " | ".join(_alias_part(x) for x in v.args)
+    # `list[int]`, not `list[<class 'int'>]` -- see `_alias_part`.
+    inner = ", ".join(_alias_part(x) for x in v.args) \
+        if isinstance(v.args, (list, tuple)) else _alias_part(v.args)
+    return f"{_alias_part(v.origin)}[{inner}]"
+
+
 def _alias_part(x) -> str:
     """How one piece of an alias renders.
 
@@ -8667,6 +8722,8 @@ def _alias_part(x) -> str:
     CPython's alias repr uses the qualname, and the difference shows in every
     annotation a program prints.
     """
+    if isinstance(x, Alias):
+        return _alias_text(x)
     if isinstance(x, Func) and getattr(x, "is_type", False):
         return x.name
     if isinstance(x, Class):

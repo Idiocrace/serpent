@@ -54,6 +54,13 @@ def apy_get_origin(v: ptr) -> ptr:
     """
     if i64(load(i32, offset(v, 0))) == apy_alias_kind():
         return ptr(load(u64, offset(v, apy_ga_origin_offset())))
+    # AN INSTANCE IS ASKED FOR ITS `__origin__`. `typing.Generic`'s own
+    # `__class_getitem__` is written in Python -- see `bundled/typing.py` --
+    # so `Box[int]` is an ordinary instance rather than this kind, and both
+    # carry the same two attributes.
+    if i64(load(i32, offset(v, 0))) == apy_inst_kind():
+        return apy_getattr_default(
+            v, apy_from_cstr(rodata(b"__origin__\0")), apy_none())
     return apy_none()
 
 
@@ -67,6 +74,9 @@ def apy_get_args(v: ptr) -> ptr:
     """
     if i64(load(i32, offset(v, 0))) == apy_alias_kind():
         return ptr(load(u64, offset(v, apy_ga_args_offset())))
+    if i64(load(i32, offset(v, 0))) == apy_inst_kind():
+        return apy_getattr_default(
+            v, apy_from_cstr(rodata(b"__args__\0")), apy_tuple_new(1))
     return apy_tuple_new(1)
 
 

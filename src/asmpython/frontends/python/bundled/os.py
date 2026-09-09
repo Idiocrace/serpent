@@ -4,7 +4,9 @@ COVERAGE: `os.path` -- `join`, `basename`, `dirname`, `splitext`, `normpath`,
 `isabs`, `exists`, `isfile`, `isdir`, and `abspath` for an ALREADY-ABSOLUTE
 path only (see below). `os.remove`/`unlink`, `os.rmdir`, `os.mkdir`,
 `os.makedirs`, `os.getenv`, `os.environ` (read-only: `[]`, `.get`, `in` --
-NOT iteration, NOT assignment), `os.linesep`, `os.sep`, `os.pathsep`. Each
+NOT iteration, NOT assignment), `os.linesep`, `os.sep`, `os.pathsep`.
+PEP 519's `os.fspath` and `os.PathLike` -- the second a real ABC, so a class
+with `__fspath__` is path-like structurally and `register` works. Each
 of the five mutating calls raises the same EXCEPTION CLASS CPython does for
 "missing", "already exists" and "not empty" -- `FileNotFoundError`,
 `FileExistsError`, `OSError` -- because they go straight to
@@ -74,6 +76,7 @@ is a question about the target this module has not answered yet, same as
 there. See `pathlib.py`'s module docstring for the open half of that.
 """
 
+import abc as _abc
 import pathlib as _pathlib
 
 
@@ -111,13 +114,55 @@ def _refuse(what):
 # module docstring for why reusing `PurePosixPath` here would be a plausible
 # WRONG answer rather than a reuse.
 
-def _fspath(p):
-    """A `str` from `p`, accepting anything with `__fspath__` too -- the same
-    thing CPython's `os.fspath` does for the cases this module reaches: a
-    plain `str`, or one of this module's own `Path` objects."""
-    if isinstance(p, str):
-        return p
-    return p.__fspath__()
+class PathLike(_abc.ABC):
+    """`os.PathLike` -- PEP 519's ABC for anything that names a file.
+
+    STRUCTURAL, like CPython's: `__subclasshook__` asks whether the class has
+    `__fspath__` at all, so `pathlib.PurePath` answers True for it without
+    ever having been registered, and so does a class a program wrote five
+    minutes ago. Inheriting from it works too, and so does `register`, which
+    is the reason this is a real ABC rather than a class with a hand-written
+    metaclass -- both are part of what a program may do with it.
+    """
+
+    __slots__ = ()
+
+    @_abc.abstractmethod
+    def __fspath__(self):
+        """The file system path this object stands for, as a `str`."""
+        raise NotImplementedError
+
+    @classmethod
+    def __subclasshook__(cls, subclass):
+        # NotImplemented FOR A SUBCLASS OF THIS ONE, so the ordinary MRO
+        # answer stands rather than this hook deciding for a class that
+        # inherited the abstract method and has not overridden it.
+        if cls is PathLike:
+            return hasattr(subclass, "__fspath__")
+        return NotImplemented
+
+
+def fspath(path):
+    """`os.fspath(path)` -- the `str` (or `bytes`) a path-like object names.
+
+    A `str` OR `bytes` PASSES STRAIGHT THROUGH, unchanged and un-copied,
+    which is what makes this safe to call on an argument that may already be
+    either. Everything else is asked for `__fspath__`, and what that answers
+    is checked: a `__fspath__` returning an int is the class's error and
+    CPython names it rather than handing the number on.
+    """
+    if isinstance(path, str) or isinstance(path, bytes):
+        return path
+    hook = getattr(path, "__fspath__", None)
+    if hook is None:
+        raise TypeError("expected str, bytes or os.PathLike object, not "
+                        + type(path).__name__)
+    got = hook()
+    if isinstance(got, str) or isinstance(got, bytes):
+        return got
+    raise TypeError("expected " + type(path).__name__
+                    + ".__fspath__() to return str or bytes, not "
+                    + type(got).__name__)
 
 
 def _splitroot(p):
@@ -143,9 +188,9 @@ class _OsPath:
     with no splice machinery involved past `os` itself."""
 
     def join(self, a, *parts):
-        path = _fspath(a)
+        path = fspath(a)
         for b in parts:
-            b = _fspath(b)
+            b = fspath(b)
             if b.startswith("/") or not path:
                 path = b
             elif path.endswith("/"):
@@ -155,12 +200,12 @@ class _OsPath:
         return path
 
     def basename(self, p):
-        p = _fspath(p)
+        p = fspath(p)
         i = p.rfind("/") + 1
         return p[i:]
 
     def dirname(self, p):
-        p = _fspath(p)
+        p = fspath(p)
         i = p.rfind("/") + 1
         head = p[:i]
         if head and head != "/" * len(head):
@@ -176,7 +221,7 @@ class _OsPath:
         the same rule `pathlib.suffix` states for a single leading dot and
         generalises here to a run of them, matching CPython's own loop.
         """
-        p = _fspath(p)
+        p = fspath(p)
         sep_index = p.rfind("/")
         dot_index = p.rfind(".")
         if dot_index > sep_index:
@@ -188,7 +233,7 @@ class _OsPath:
         return p, ""
 
     def normpath(self, path):
-        path = _fspath(path)
+        path = fspath(path)
         if not path:
             return "."
         _, initial_slashes, rest = _splitroot(path)
@@ -206,14 +251,14 @@ class _OsPath:
         return out if out else "."
 
     def isabs(self, p):
-        return _fspath(p).startswith("/")
+        return fspath(p).startswith("/")
 
     def abspath(self, path):
         """`normpath(path)` for an ALREADY-ABSOLUTE path; a relative one is
         refused. See the module docstring: making a relative path absolute
         needs `os.getcwd`, which has nowhere to get a working directory
         from."""
-        path = _fspath(path)
+        path = fspath(path)
         if path.startswith("/"):
             return self.normpath(path)
         _refuse("path.abspath given a relative path -- there is no "
@@ -224,13 +269,13 @@ class _OsPath:
         question and is already proved against CPython -- see the module
         docstring for why this half reuses it and the string half does
         not."""
-        return _pathlib.Path(_fspath(p)).exists()
+        return _pathlib.Path(fspath(p)).exists()
 
     def isfile(self, p):
-        return _pathlib.Path(_fspath(p)).is_file()
+        return _pathlib.Path(fspath(p)).is_file()
 
     def isdir(self, p):
-        return _pathlib.Path(_fspath(p)).is_dir()
+        return _pathlib.Path(fspath(p)).is_dir()
 
 
 path = _OsPath()
@@ -275,7 +320,7 @@ def _raise_host_error(code, path):
 
 
 def remove(path):
-    p = _fspath(path)
+    p = fspath(path)
     raw = p.encode("utf-8")
     code = host_file_remove(raw, len(raw))
     if code != 0:
@@ -288,7 +333,7 @@ unlink = remove
 
 
 def rmdir(path):
-    p = _fspath(path)
+    p = fspath(path)
     raw = p.encode("utf-8")
     code = host_dir_remove(raw, len(raw))
     if code != 0:
@@ -296,7 +341,7 @@ def rmdir(path):
 
 
 def mkdir(path, mode=511):
-    p = _fspath(path)
+    p = fspath(path)
     raw = p.encode("utf-8")
     code = host_dir_make(raw, len(raw))
     if code != 0:
@@ -316,7 +361,7 @@ def makedirs(name, mode=511, exist_ok=False):
     `makedirs` means by "and every missing ancestor": the ones that were
     not missing are not a problem.
     """
-    p = _fspath(name)
+    p = fspath(name)
     stack = []
     cur = p
     while cur and cur != "/" and cur != ".":

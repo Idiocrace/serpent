@@ -29,8 +29,11 @@ interpreter with only `Integral.register(int)` answers `True` for
 `Number` -- CPython answers `True` for all five. `collections.abc` never hit
 this because it registers `dict` at `Mapping`, `MutableMapping` AND
 `Reversible` individually rather than relying on one registration to reach
-the others; this module does the same, at every applicable level, for both
-builtins it registers.
+the others; this module does the same, at every applicable level, for every
+builtin it registers -- AND `bool` REGISTERS SEPARATELY FROM `int`, which
+CPython does not have to do: `bool` is a real subclass there and `_abc`
+walks its MRO, while a builtin type reached as a VALUE here has no `__mro__`
+for `ABCMeta.__subclasscheck__` to walk.
 
 `complex` IS REGISTERED WITH `Complex`, as the line at the bottom of this
 file, matching CPython -- and it does not make `isinstance` or `issubclass`
@@ -437,3 +440,17 @@ Rational.register(int)
 Real.register(int)
 Complex.register(int)
 Number.register(int)
+
+# `bool` IS AN `int`, AND HAS TO SAY SO ITSELF HERE. CPython registers only
+# `int` and `isinstance(True, Integral)` is True anyway, because `bool` is a
+# real subclass of `int` and `_abc` walks its MRO. A builtin type reached as a
+# VALUE in this frontend has no `__mro__` to walk -- `ABCMeta.__subclasscheck__`
+# gets an empty tuple and falls through to comparing the registry entries by
+# identity, where `bool is int` is False. So the subclass registers too, at
+# every level, which is the same shape of workaround the docstring above
+# describes for registering at each level rather than only the leaf.
+Integral.register(bool)
+Rational.register(bool)
+Real.register(bool)
+Complex.register(bool)
+Number.register(bool)

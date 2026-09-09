@@ -450,15 +450,29 @@ APY_API int64_t apy_is_special_form(apy_value v) {
 /* THE NAME ITS CALLERS USE, kept as a delegate: the body is IR's now,
    and the exported half above stands in when nothing is ported. */
 
-/* `get_origin(x)` -- what was subscripted, or None. */
+APY_API apy_value apy_getattr_default(apy_value obj, apy_value name,
+                                      apy_value fallback);
+
+/* `get_origin(x)` -- what was subscripted, or None.
+
+   AN INSTANCE IS ASKED FOR ITS `__origin__`. `typing.Generic`'s own
+   `__class_getitem__` is written in Python -- see `bundled/typing.py` -- so
+   `Box[int]` is an ordinary instance rather than the alias kind `list[int]`
+   builds, and both spellings carry the same two attributes. Reading the
+   attribute covers the user generic without changing a single answer for the
+   builtin one. A MISS IS NOT AN ERROR: `get_origin(3)` is None in CPython. */
 APY_API apy_value apy_get_origin(apy_value v) {
     if (O(v)->kind == APY_ALIAS_K) return O(v)->v.ga.origin;
+    if (O(v)->kind == APY_INST_K)
+        return apy_getattr_default(v, apy_lit("__origin__"), apy_none());
     return apy_none();
 }
 
 /* `get_args(x)` -- what it was subscripted WITH, or the empty tuple. */
 APY_API apy_value apy_get_args(apy_value v) {
     if (O(v)->kind == APY_ALIAS_K) return O(v)->v.ga.args;
+    if (O(v)->kind == APY_INST_K)
+        return apy_getattr_default(v, apy_lit("__args__"), apy_tuple_new(1));
     return apy_tuple_new(1);
 }
 

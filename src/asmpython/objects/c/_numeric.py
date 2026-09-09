@@ -907,13 +907,27 @@ static apy_value apy_view_as_set(apy_value v) {
 }
 
 /* Is this something `|` should read as a TYPE? A builtin type used as a
-   value, a user class, or a union already built from either. */
+   value, a user class, or ANY parameterised type.
+
+   ANY ALIAS, not only a union: `list[int] | None` and
+   `Annotated[str, 'o'] | None` are both ordinary unions in CPython, and
+   requiring the origin to be a `typing` special form refused the first and
+   mis-read the second. */
 static int apy_is_type_like(apy_value v) {
     if (O(v)->kind == APY_FUNC_K && O(v)->v.fn.is_type) return 1;
     if (O(v)->kind == APY_TYPE_K) return 1;
     if (O(v)->kind == APY_NONE_K) return 1;      /* `int | None` */
+    return O(v)->kind == APY_ALIAS_K;
+}
+
+/* Is this a UNION -- `int | str` -- rather than some other parameterised
+   form? `apy_is_type_like` above accepts any INST_K origin, which every
+   `typing` special form has, and that is too loose here: only a union's arms
+   are order-free. `tuple[int, str]` and `tuple[str, int]` are different
+   types, and so are `Callable[[int], str]` and `Callable[[str], int]`. */
+static int apy_is_union(apy_value v) {
     return O(v)->kind == APY_ALIAS_K
-        && O(O(v)->v.ga.origin)->kind == APY_INST_K;
+        && O(v)->v.ga.origin == apy_typing_form(apy_lit("Union"));
 }
 
 /* `int | str | int` HAS TWO ARMS. CPython drops a repeat when it builds the
@@ -927,10 +941,14 @@ static void apy_union_arm(apy_value into, apy_value v) {
 }
 
 /* Append `v`'s arms to `into`. A union contributes its own arms rather than
-   itself, so unions flatten instead of nesting. */
+   itself, so unions flatten instead of nesting.
+
+   ONLY A UNION FLATTENS. Every `typing` special form has an INST_K origin, so
+   testing for one flattened `Annotated[str, 'o']` too and
+   `Optional[Annotated[str, 'o']]` came out as `str | 'o' | None` -- the
+   metadata promoted to an arm of the union. */
 static void apy_union_arms(apy_value into, apy_value v) {
-    if (O(v)->kind == APY_ALIAS_K
-            && O(O(v)->v.ga.origin)->kind == APY_INST_K) {
+    if (apy_is_union(v)) {
         int64_t i;
         for (i = 0; i < O(O(v)->v.ga.args)->v.q.n; i++)
             apy_union_arm(into, O(O(v)->v.ga.args)->v.q.items[i]);
@@ -942,16 +960,6 @@ static void apy_union_arms(apy_value into, apy_value v) {
        different object with a different repr. */
     if (O(v)->kind == APY_NONE_K) { apy_union_arm(into, apy_kind_class(v)); return; }
     apy_union_arm(into, v);
-}
-
-/* Is this a UNION -- `int | str` -- rather than some other parameterised
-   form? `apy_is_type_like` above accepts any INST_K origin, which every
-   `typing` special form has, and that is too loose here: only a union's arms
-   are order-free. `tuple[int, str]` and `tuple[str, int]` are different
-   types, and so are `Callable[[int], str]` and `Callable[[str], int]`. */
-static int apy_is_union(apy_value v) {
-    return O(v)->kind == APY_ALIAS_K
-        && O(v)->v.ga.origin == apy_typing_form(apy_lit("Union"));
 }
 
 /* Do two unions have the SAME ARMS, in any order and however often each is

@@ -191,3 +191,9 @@ print(issubclass(ThirdPartyInt, numbers.Integral))
 # REGISTRATION IS NOT INHERITANCE: nothing about ThirdPartyInt changed, so it
 # still has none of the mixin methods.
 print(hasattr(ThirdPartyInt, "numerator"))
+
+# A `bool` IS AN `int`, and the tower has to say so at every level.
+print(isinstance(True, numbers.Integral), isinstance(False, numbers.Rational))
+print(isinstance(True, numbers.Real), isinstance(True, numbers.Complex))
+print(isinstance(True, numbers.Number), isinstance("x", numbers.Number))
+print(issubclass(bool, numbers.Integral), issubclass(str, numbers.Number))

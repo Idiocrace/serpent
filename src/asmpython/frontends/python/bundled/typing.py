@@ -8,13 +8,18 @@ identity-wrapping callable, with `__name__` and `__supertype__`); `cast` (a
 real no-op passthrough); `overload` (a real decorator -- see below for why it
 needs almost no machinery); `Protocol` + `runtime_checkable`, structural
 `isinstance` checking built the same way `bundled/abc.py` builds one;
-`get_type_hints`, built on the now-bundled `annotationlib.get_annotations`;
-`NamedTuple` and `TypedDict`, but ONLY THE FUNCTIONAL FORM -- see below for
-why the class-based form is refused rather than silently wrong.
+`get_type_hints`, built on the now-bundled `annotationlib.get_annotations`,
+with `include_extras=False` stripping `Annotated` the way CPython's does;
+`ParamSpec` (with `.args`/`.kwargs`) and `TypeVarTuple`, both real objects
+rather than the inert form the native table had; `dataclass_transform`, PEP
+681's marker, which returns its argument and leaves
+`__dataclass_transform__` on it; `NamedTuple` and `TypedDict`, but ONLY THE
+FUNCTIONAL FORM -- see below for why the class-based form is refused rather
+than silently wrong.
 
 EVERYTHING ELSE `typing` NAMES -- `Any`, `Union`, `Optional`, `Callable`,
-`Literal`, the container aliases, `Annotated`, `ParamSpec`, `Required` and
-the rest of PEP 484's annotation-only vocabulary, plus `final`, `override`,
+`Literal`, the container aliases, `Annotated`, `Required` and the rest of
+PEP 484's annotation-only vocabulary, plus `final`, `override`,
 `no_type_check`, `get_origin` and `get_args` -- stays exactly where it was:
 `frontends/python/modules.py`'s native `_TYPING` table. Those names are
 markers a program writes in an annotation and, mostly, never inspects at
@@ -93,19 +98,21 @@ case for every bundled module, not this one.
 ## `get_origin`/`get_args` and a user `Generic[T]` subscript
 
 The native `get_origin`/`get_args` (still reached through the untouched
-half of `_TYPING`) recognise ONE run-time shape: the alias kind
+half of `_TYPING`) knew ONE run-time shape: the alias kind
 `runtime/alias.py` builds for `list[int]`, `dict[str, int]` and a union --
 unchanged by this file. A `Box[int]` built by THIS module's own
 `Generic.__class_getitem__` is an ordinary instance of a plain Python class
 (`_GenericAlias`, below), not that native kind, so `get_origin(Box[int])`
-answers `None` rather than `Box` -- correct for CPython's own container
-aliases, wrong for a user generic. `Box[int].__origin__` and `.__args__` are
-real attributes on the object regardless and answer correctly by direct
-access; only the two native FUNCTIONS fail to recognise it. Making them
-recognise a Python-level object as well as the native kind would mean
-rewriting them in this module too, changing already-correct behaviour for
-the common case to add a narrower one -- so this is refused BY NAME instead:
-`get_origin`/`get_args` on a user `Generic[T]` subscript is not covered.
+answered `None` rather than `Box`.
+
+IT IS COVERED NOW, and not by rewriting the two functions here. Both shapes
+carry the SAME TWO ATTRIBUTES -- `__origin__` and `__args__` -- so the
+native pair reads them off an instance when the value is not the alias kind,
+which adds the user generic without changing one answer for the builtin one.
+That way a program wanting only `get_origin` still pays nothing: rewriting
+them in this module would have spliced the whole of `typing` into it. See
+`runtime/alias.py`, `objects/c/_classes.py` and `ir/objects_host.py`, each
+of which has the same two-line instance branch.
 
 ## `Protocol` covers method-based structural protocols, not attribute ones
 
@@ -160,6 +167,72 @@ class TypeVar:
         else:
             prefix = "~"
         return prefix + self.__name__
+
+
+class _ParamSpecPart:
+    """`P.args` or `P.kwargs` -- the two halves of a `ParamSpec`.
+
+    A SEPARATE OBJECT, not a string, because what a program checks about one
+    is `__origin__ is P`: PEP 612 says the pair belongs to the ParamSpec it
+    came from, and that is the only run-time claim either makes.
+    """
+
+    def __init__(self, origin, part):
+        self.__origin__ = origin
+        self._part = part
+
+    def __repr__(self):
+        return self.__origin__.__name__ + "." + self._part
+
+
+class ParamSpec:
+    """PEP 612's placeholder for a whole PARAMETER LIST.
+
+    A `TypeVar` stands for one type; this stands for the arguments of a
+    callable, which is what lets a decorator say it takes and returns the
+    same signature. Like `TypeVar`, nothing here checks anything -- the
+    constructor's whole run-time job is to remember the name and to hand back
+    `.args` and `.kwargs` when asked.
+    """
+
+    def __init__(self, name, *, bound=None, covariant=False,
+                 contravariant=False, infer_variance=False):
+        self.__name__ = name
+        self.__bound__ = bound
+        self.__covariant__ = covariant
+        self.__contravariant__ = contravariant
+        self.__infer_variance__ = infer_variance
+
+    @property
+    def args(self):
+        return _ParamSpecPart(self, "args")
+
+    @property
+    def kwargs(self):
+        return _ParamSpecPart(self, "kwargs")
+
+    def __repr__(self):
+        if self.__covariant__:
+            return "+" + self.__name__
+        if self.__contravariant__:
+            return "-" + self.__name__
+        return "~" + self.__name__
+
+
+class TypeVarTuple:
+    """PEP 646's placeholder for ANY NUMBER of types.
+
+    `Ts` stands for a whole run of type arguments, so `Arr[int, str]` binds
+    two where `Box[int]` binds one. The run-time object is the name and
+    nothing else, and its repr is the BARE name -- unlike `TypeVar`'s, which
+    carries a variance sigil that a variadic has no room for.
+    """
+
+    def __init__(self, name):
+        self.__name__ = name
+
+    def __repr__(self):
+        return self.__name__
 
 
 # ── Generic ──────────────────────────────────────────────────────────────
@@ -312,14 +385,52 @@ def runtime_checkable(cls):
 
 # ── get_type_hints ───────────────────────────────────────────────────────
 
+def _strip_extras(hint):
+    """`Annotated[X, ...]` down to `X`, wherever it appears.
+
+    WHAT `include_extras=False` MEANS, and it is the default: CPython hands
+    back `int` for `x: Annotated[int, "positive"]` unless the caller asks for
+    the metadata, so a program that only wants the type does not have to know
+    the annotation carried any.
+
+    THROUGH THE ATTRIBUTES RATHER THAN `get_origin`/`get_args`, which are
+    native names this module does not import -- and the two spellings of a
+    parameterised type carry the same pair either way. `_name` is what the
+    `typing` special forms are interned under, so it is what tells
+    `Annotated` from `Literal` without naming either.
+
+    REBUILT BY SUBSCRIPTING THE ORIGIN when an inner argument changed, so a
+    nested one goes too: `list[Annotated[int, "m"]]` is `list[int]`. The
+    object is handed back UNCHANGED when nothing under it was annotated,
+    which keeps identity for the common case.
+    """
+    origin = getattr(hint, "__origin__", None)
+    if origin is None:
+        return hint
+    args = getattr(hint, "__args__", ())
+    if getattr(origin, "_name", None) == "Annotated":
+        return _strip_extras(args[0])
+    inner = []
+    changed = False
+    for one in args:
+        got = _strip_extras(one)
+        if got is not one:
+            changed = True
+        inner.append(got)
+    if not changed:
+        return hint
+    return origin[tuple(inner)]
+
+
 def get_type_hints(obj, globalns=None, localns=None, include_extras=False):
     """The resolved annotations of a function or class, as real objects.
 
     BUILT ON `annotationlib.get_annotations`, which is what this runtime's
     PEP 649 thunks were ever able to give -- see `bundled/annotationlib.py`
-    for exactly what that covers and refuses. `include_extras` is accepted
-    and has nothing to do here: this module does not implement `Annotated`,
-    which is the only thing that flag changes.
+    for exactly what that covers and refuses.
+
+    `include_extras=False` STRIPS `Annotated`, which is the only thing the
+    flag changes and is the default -- see `_strip_extras`.
 
     A CLASS MERGES ITS WHOLE `__mro__`, reversed so a subclass's own
     annotation wins over a base's -- CPython does the same. Every class here
@@ -335,9 +446,15 @@ def get_type_hints(obj, globalns=None, localns=None, include_extras=False):
             ann = annotationlib.get_annotations(
                 base, globals=globalns, locals=localns, eval_str=True)
             hints.update(ann)
+    else:
+        hints = annotationlib.get_annotations(
+            obj, globals=globalns, locals=localns, eval_str=True)
+    if include_extras:
         return hints
-    return annotationlib.get_annotations(
-        obj, globals=globalns, locals=localns, eval_str=True)
+    out = {}
+    for key in hints:
+        out[key] = _strip_extras(hints[key])
+    return out
 
 
 # ── NamedTuple, functional form only ─────────────────────────────────────
@@ -396,3 +513,38 @@ def TypedDict(typename, fields, total=True):
         "__total__": total,
     }
     return _TypedDictMeta(typename, (_TypedDictBase,), body)
+
+
+def dataclass_transform(*, eq_default=True, order_default=False,
+                        kw_only_default=False, frozen_default=False,
+                        field_specifiers=(), **kwargs):
+    """PEP 681's marker -- INERT AT RUN TIME, and that is the whole of it.
+
+    It says to a TYPE CHECKER that the decorated class, function or metaclass
+    builds dataclass-like classes. Nothing here reads it, and nothing in
+    CPython does either: `dataclasses.dataclass` is not affected by it, and
+    `@dataclass_transform()` on a decorator does not make that decorator do
+    anything. What it MUST do is return its argument unchanged and leave
+    `__dataclass_transform__` on it, because a program can read that back --
+    which is exactly what makes "inert" testable.
+
+    NOT IN THE NATIVE `_TYPING` TABLE, unlike `runtime_checkable` and
+    `no_type_check`: those are one-argument mark-and-return decorators and
+    this takes only keywords and returns a decorator, which is a different
+    shape. See `frontends/python/modules.py`, which says so at the table.
+
+    `**kwargs` IS PART OF THE SPECIFIED SIGNATURE. PEP 681 lets a checker
+    accept extra keywords it understands, and CPython files whatever it was
+    given under `"kwargs"` rather than refusing it.
+    """
+    def decorator(cls_or_fn):
+        cls_or_fn.__dataclass_transform__ = {
+            "eq_default": eq_default,
+            "order_default": order_default,
+            "kw_only_default": kw_only_default,
+            "frozen_default": frozen_default,
+            "field_specifiers": field_specifiers,
+            "kwargs": kwargs,
+        }
+        return cls_or_fn
+    return decorator

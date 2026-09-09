@@ -162,3 +162,60 @@ show("PartialMovie.__required_keys__", sorted(PartialMovie.__required_keys__))
 show("PartialMovie.__optional_keys__", sorted(PartialMovie.__optional_keys__))
 
 print("done")
+
+# ---- ParamSpec and TypeVarTuple -------------------------------------------
+P = typing.ParamSpec("P")
+print(P.__name__, repr(P))
+print(P.args, P.kwargs, P.args.__origin__ is P)
+print(typing.get_args(typing.Callable[P, int])[1] is int)
+
+Ts = typing.TypeVarTuple("Ts")
+print(Ts.__name__, repr(Ts))
+
+
+class Arr(typing.Generic[typing.Unpack[Ts]]):
+    pass
+
+
+print(Arr[int, str].__args__)
+
+# ---- get_origin/get_args reach a user generic too --------------------------
+T2 = typing.TypeVar("T2")
+
+
+class Box2(typing.Generic[T2]):
+    pass
+
+
+print(typing.get_origin(Box2[int]) is Box2, typing.get_args(Box2[int]))
+print(typing.get_origin(3), typing.get_args(3))
+print(typing.get_origin(list[int]), typing.get_args(dict[str, int]))
+
+# ---- Annotated: stripped by default, kept on request ----------------------
+Ann = typing.Annotated
+
+
+class Held:
+    a: Ann[int, "m"]
+    b: list[Ann[int, "n"]]
+    c: typing.Optional[Ann[str, "o"]]
+
+
+for key in ("a", "b", "c"):
+    print(key, typing.get_type_hints(Held)[key],
+          "|", typing.get_type_hints(Held, include_extras=True)[key])
+
+# ---- dataclass_transform is inert, and says so ----------------------------
+@typing.dataclass_transform(order_default=True)
+def model(cls):
+    return cls
+
+
+@model
+class Marked:
+    x: int
+
+
+print(Marked.__name__, model.__dataclass_transform__["eq_default"],
+      model.__dataclass_transform__["order_default"],
+      model.__dataclass_transform__["field_specifiers"])

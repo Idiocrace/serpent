@@ -141,3 +141,37 @@ print(repr(os.linesep), repr(os.sep), repr(os.pathsep))
 # on.
 
 print("done")
+
+# PEP 519: `os.fspath` and `os.PathLike`. STRUCTURAL -- a class with
+# `__fspath__` is path-like without registering anything.
+import pathlib as _pl
+
+
+class Named:
+    def __fspath__(self):
+        return "custom/path"
+
+
+class BadNamed:
+    def __fspath__(self):
+        return 7
+
+
+print(os.fspath("plain"), os.fspath(b"raw"))
+print(os.fspath(Named()), os.fspath(_pl.PurePosixPath("a/b")))
+print(isinstance(Named(), os.PathLike), isinstance("s", os.PathLike))
+print(issubclass(Named, os.PathLike), issubclass(str, os.PathLike),
+      issubclass(_pl.PurePosixPath, os.PathLike))
+for bad in (7, BadNamed()):
+    try:
+        os.fspath(bad)
+    except TypeError as exc:
+        print(exc)
+
+
+class Sub(os.PathLike):
+    def __fspath__(self):
+        return "sub"
+
+
+print(os.fspath(Sub()), isinstance(Sub(), os.PathLike), os.path.join("a", Named()))
