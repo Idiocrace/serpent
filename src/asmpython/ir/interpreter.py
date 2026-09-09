@@ -62,6 +62,11 @@ class Frame:
     #: loop -- see `Interpreter._analyze`). A fresh copy per call, since
     #: it counts down over the course of ONE invocation.
     remaining: dict[int, int] | None = None
+    #: Registers `_consume` must never retire early -- every parameter and
+    #: every register ever assigned by `Op.COPY`, which is how a NAMED
+    #: Python variable is told from a compiler temporary. Shared across
+    #: calls (purely static, from `_analyze`), unlike `remaining`.
+    named: frozenset[int] = frozenset()
 
 
 class Memory:
@@ -360,7 +365,8 @@ class Interpreter:
         # first `apy_*` call had a chance to create one. `_consume`
         # guards the actual decref on `self.objects` itself, which by
         # the time anything reaches it, is set.
-        has_loop, read_count = self._analyze(fn)
+        has_loop, read_count, named = self._analyze(fn)
+        fr.named = named
         if not has_loop:
             fr.remaining = dict(read_count)
         for reg, val in zip(fn.params, args):
@@ -423,11 +429,11 @@ class Interpreter:
                         continue
                     self.objects.decref(val)
 
-    def _analyze(self, fn: Function) -> tuple[bool, dict[int, int]]:
-        """Whether `fn` has a loop, and how many times each `T.PTR`
-        register is READ (an operand of some instruction, anywhere in the
-        function) in total. Memoised per function -- purely static, so it
-        never changes across calls.
+    def _analyze(self, fn: Function) -> tuple[bool, dict[int, int], frozenset[int]]:
+        """Whether `fn` has a loop, how many times each `T.PTR` register is
+        READ (an operand of some instruction, anywhere in the function) in
+        total, and which registers are NAMED -- see below. Memoised per
+        function -- purely static, so it never changes across calls.
 
         WHAT THIS BUYS: `Op.COPY` and `Op.STORE` -- `x = <expr>` and a
         global/attribute assignment -- read a source register whose value
@@ -452,18 +458,43 @@ class Interpreter:
         that is real control-flow analysis; ruling out the whole function
         is the cheap, safe version -- registers in it simply keep waiting
         for frame teardown, exactly as they did before this existed.
+
+        NAMED REGISTERS ARE NEVER RETIRED AT THEIR LAST READ, and this is
+        not an optimisation left on the table -- it is the difference
+        between a compiler TEMPORARY and a Python VARIABLE, and `_consume`
+        finalizing the wrong one is a real bug this analysis exists to
+        prevent, not a missed case. `dynamic.py` gives every named local,
+        parameter and closure slot ONE PERSISTENT register, written via
+        `Op.COPY` for each assignment (`_dyn_store`) -- so `y = x` reads
+        `x`'s register as `Op.COPY`'s SOURCE. If `x` happens not to be
+        read again after that line, its read count reaches zero right
+        there, and retiring it would drop `x`'s OWN reference the moment
+        `y = x` runs -- even though `x` is still a live, bound name that
+        CPython would not release until reassignment, `del`, or the
+        function's return. `print(x.name)` is the same hazard through a
+        CALL argument instead of a COPY source. Measured: both finalized
+        an object at its last syntactic mention, one and sometimes two
+        statements before CPython would have. So a register is NAMED --
+        excluded from `_consume` entirely -- if it is ever a PARAMETER, or
+        ever the `dst` of an `Op.COPY` anywhere in the function; a true
+        temporary (a CALL's raw result, handed to exactly one COPY/STORE/
+        CALL argument and never itself assigned INTO) is never `Op.COPY`'s
+        destination and keeps the optimisation.
         """
         cached = self._fn_analysis.get(id(fn))
         if cached is not None:
             return cached
         has_loop = self._has_cycle(fn)
         read_count: dict[int, int] = {}
+        named: set[int] = set(fn.params)
         for blk in fn.blocks:
             for ins in blk.instructions:
                 for reg in ins.args:
                     if fn.registers.get(reg) is T.PTR:
                         read_count[reg] = read_count.get(reg, 0) + 1
-        result = (has_loop, read_count)
+                if ins.op is Op.COPY and ins.dst is not None:
+                    named.add(ins.dst)
+        result = (has_loop, read_count, frozenset(named))
         self._fn_analysis[id(fn)] = result
         return result
 
@@ -555,6 +586,11 @@ class Interpreter:
             # not know that when it builds `read_count`, since it has no
             # way to tell a handle-shaped program from an address-shaped
             # one ahead of time. Nothing to consume in that case.
+            return
+        if reg in fr.named:
+            # A PYTHON VARIABLE, not a temporary -- see `_analyze`'s own
+            # comment on why this register's LAST static read is not
+            # when CPython would drop it, and never retired here.
             return
         left = fr.remaining.get(reg)
         if left is None:
