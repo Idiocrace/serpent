@@ -410,29 +410,37 @@ class Interpreter:
         finally:
             self.mem.brk = prev_brk     # frame allocas die with the frame
             if self.objects is not None:
-                # EVERY REGISTER IN THIS FRAME IS GOING OUT OF SCOPE. Decref
-                # each one that held a handle -- EXCEPT ONE occurrence of
-                # whatever is being returned (`returned` stays `None`, and
-                # so matches nothing, on a trap/exception rather than a real
-                # return): that reference is being HANDED TO THE CALLER, not
-                # dropped, and the caller's own `put()` -- in whichever
-                # `_exec` called this -- will count its new ownership on
-                # receipt. Skipping the decref here rather than fixing this
-                # frame's copy up first and asking the caller not to
-                # re-count leaves a handle passed through several nested
-                # returns slightly OVER-counted -- finalized a step too
-                # LATE, never a step too EARLY -- which is the direction
-                # `ObjectHost.decref`'s own docstring says is safe to be
-                # wrong in.
-                skipped = False
+                # EVERY REGISTER IN THIS FRAME IS GOING OUT OF SCOPE, so
+                # every one that held a handle is decref'd -- INCLUDING
+                # whatever is being returned, which is the part that took
+                # two tries to get right.
+                #
+                # The first version SKIPPED one occurrence of the returned
+                # handle, reasoning that the reference was being handed to
+                # the caller rather than dropped. It is not: the caller's
+                # own `put()` adds its OWN incref on receipt, so keeping
+                # this frame's as well counts the same reference twice,
+                # permanently. `def get(x): return x` then `a = get(d)`
+                # left `d` one over for the rest of the run, and `del a;
+                # del d` never finalized it -- a LEAK, not the "a step too
+                # late" the old comment claimed.
+                #
+                # PINNED, THEN DECREF'D, which is what the skip was really
+                # reaching for: the pin (`ObjectHost._protect`) holds off
+                # finalization for the window between this frame dropping
+                # its reference and the caller's `put()` taking one, so a
+                # value whose ONLY reference was this frame's does not
+                # finalize in the gap. `put()` lifts the pin through
+                # `settle` once the value has a counted home -- the same
+                # handoff `_instantiate` uses for a freshly built object,
+                # and for the same reason.
+                if returned:
+                    self.objects.protect_handoff(returned)
                 for reg, ty in fr.func.registers.items():
                     if ty is not T.PTR:
                         continue
                     val = fr.registers.get(reg)
                     if not val:
-                        continue
-                    if not skipped and val == returned:
-                        skipped = True
                         continue
                     self.objects.decref(val)
 
@@ -687,6 +695,16 @@ class Interpreter:
                     if old:
                         self.objects.decref(old)
                 R[ins.dst] = v
+            elif v and self.objects is not None and ty is T.PTR:
+                # NO DESTINATION AT ALL -- a call whose result the program
+                # discards, `f()` written as a statement. Nothing will
+                # ever store this value, so nothing else would lift the
+                # pin `_call`'s teardown put on a returned value, and a
+                # pin nothing lifts is an object that never finalizes.
+                # Lifted here instead, which is also where CPython
+                # finalizes a discarded temporary: at the end of the
+                # statement that produced it.
+                self.objects.release_handoff(v)
             return None
 
         if op is Op.CONST:
@@ -713,7 +731,21 @@ class Interpreter:
         if op in (Op.SHL, Op.SHR):
             return put(_shift(op, ty, int(a(0)), int(a(1))))
         if op in _CMP:
-            return put(1 if _compare(op, ty, a(0), a(1)) else 0)
+            res = put(1 if _compare(op, ty, a(0), a(1)) else 0)
+            # See `_consume`. SAFE HERE FOR THE REASON `Op.CALL`'S
+            # ARGUMENTS WERE NOT: a comparison is executed by this
+            # interpreter itself and retains nothing -- it reads two
+            # values and writes an `i1` -- so there is no callee whose
+            # own storage behaviour would have to be audited first,
+            # which is exactly what made the call-argument version of
+            # this unsafe. This is the MACHINE-level comparison; a
+            # Python-level `x is y` lowers to an `apy_is` CALL instead
+            # and is retired through `_NON_RETAINING`, for the same
+            # reason arrived at the same way.
+            self._consume(fr, ins.args[0])
+            if len(ins.args) > 1:
+                self._consume(fr, ins.args[1])
+            return res
 
         if op is Op.TRUNC:
             return put(_wrap(int(a(0)), ty))
@@ -796,6 +828,17 @@ class Interpreter:
         if op is Op.OFFSET:
             return put(int(a(0)) + int(a(1)))
 
+        if op is Op.CALL and ins.sym in _NON_RETAINING:
+            callee = self.module.function(ins.sym)
+            if callee is None:
+                raise Trap(f"call to unknown function {ins.sym!r}")
+            res = put(self._call(callee, [R[x] for x in ins.args]))
+            # See `_NON_RETAINING`: the one narrow exception to the rule
+            # below, for calls whose bodies have been READ and keep
+            # nothing.
+            for reg in ins.args:
+                self._consume(fr, reg)
+            return res
         if op is Op.CALL:
             callee = self.module.function(ins.sym)
             if callee is None:
@@ -857,6 +900,28 @@ class _Return:
 
 _ARITH = (Op.ADD, Op.SUB, Op.MUL, Op.DIV, Op.REM, Op.AND, Op.OR, Op.XOR)
 _CMP = (Op.EQ, Op.NE, Op.LT, Op.LE, Op.GT, Op.GE)
+
+#: Object-runtime calls whose ARGUMENT temporaries `_consume` may retire
+#: at their last read -- the one exception to `Op.CALL`'s own comment on
+#: why it does not do that in general.
+#:
+#: THE RULE FOR ADDING A NAME: read the whole body and confirm it keeps
+#: NOTHING derived from its arguments -- no store into a list, dict, set,
+#: attribute dict, cell, generator slot or any table on `ObjectHost`
+#: itself -- and that it calls nothing that might. `apy_is`
+#: (`objects_host._apy_is`) is three lines: it dereferences both handles
+#: to validate them, compares the two handle NUMBERS, and answers a bool.
+#:
+#: WHY IT IS WORTH AN EXCEPTION AT ALL: `x is None` is how a program asks
+#: whether something is still there, and `r() is None` is the entire
+#: point of a `weakref` -- the deref's own result temporary, compared
+#: once and never used again, otherwise pinned the very object being
+#: asked about until the frame ended, so `weakref.ref(a)` followed by
+#: `del a` reported the referent as still alive. Every other `apy_*`
+#: name stays out until someone reads its body: guessing wrong here
+#: finalizes something still in use, which is the one direction this
+#: whole scheme refuses to be wrong in.
+_NON_RETAINING = frozenset({"apy_is"})
 
 
 def _arith(op: Op, ty: T.Type, x, y):

@@ -1166,6 +1166,43 @@ APY_API apy_value apy_index_obj(apy_value v) {
                      apy_kind_name(v), "");
 }
 
+/* `weakref.ref` -- INTERPRETER-ONLY, same reason as `sys.getrefcount`
+   above: this runtime keeps no reference count and frees nothing, so a
+   compiled build has no moment at which an object becomes weakly
+   UNREACHABLE and no honest answer to give here. Refusing BY NAME rather
+   than one of the two plausible-looking wrong answers -- always claiming
+   the target is alive (true in the sense that this runtime never frees
+   it, false in the sense that CPython's `weakref` would already have
+   said otherwise) or silently never firing a callback. */
+APY_API apy_value apy_weakref_register(apy_value target, apy_value ref_self,
+                                       apy_value callback) {
+    (void)target; (void)ref_self; (void)callback;
+    return apy_fail("NotImplementedError",
+                    "weakref needs the reference interpreter -- a compiled "
+                    "build keeps no reference count to weaken against");
+}
+
+APY_API apy_value apy_weakref_deref(apy_value target) {
+    (void)target;
+    return apy_fail("NotImplementedError",
+                    "weakref needs the reference interpreter -- a compiled "
+                    "build keeps no reference count to weaken against");
+}
+
+APY_API apy_value apy_weakref_count(apy_value target) {
+    (void)target;
+    return apy_fail("NotImplementedError",
+                    "weakref needs the reference interpreter -- a compiled "
+                    "build keeps no reference count to weaken against");
+}
+
+APY_API apy_value apy_weakref_existing(apy_value target) {
+    (void)target;
+    return apy_fail("NotImplementedError",
+                    "weakref needs the reference interpreter -- a compiled "
+                    "build keeps no reference count to weaken against");
+}
+
 /* `round` is round-HALF-TO-EVEN, which C's `round` is not: C rounds half away
    from zero, so it answers 3 for round(2.5) where Python answers 2. And
    `round(x)` with no digits returns an INT. */

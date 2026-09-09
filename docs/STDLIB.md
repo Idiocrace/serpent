@@ -79,6 +79,51 @@ not archived and are not rebuilt.
 `ctypes` is a compile-time feature of the frontend (`frontends/python/cffi.py`)
 rather than a bundled module, and is unaffected.
 
+## When an object dies, and how exactly that is known
+
+`weakref` is in the table below, and it could not be until the runtime could
+answer a question it had never been asked: WHEN does an object stop existing?
+The reference interpreter now keeps a SHADOW REFERENCE COUNT
+(`ir/objects_host.py`'s `incref`/`decref`, hooked from `ir/interpreter.py`'s
+one register-write choke point) whose only job is to make what a Python
+program can OBSERVE about lifetime match CPython: `__del__` at the right
+statement, a `weakref` going dead at the right statement, and a reference
+CYCLE surviving both -- which falls out of true refcounting for free, with
+nothing added, exactly as it does in CPython.
+
+It is a SHADOW count. Nothing is freed; `docs/INERT-RUNTIME.md`'s memory
+story is untouched, and a compiled build keeps no count at all (which is why
+`weakref`'s primitives refuse BY NAME there rather than answer a number they
+cannot know).
+
+**EXACT, measured against CPython as the oracle:** a name dropped by `del`,
+by reassignment, or by its function returning; an object dropped by the
+container holding it (`list`/`dict`/`set` element, instance attribute) being
+overwritten, removed or cleared; `x is None` on a value nothing else holds.
+
+**LATE, NEVER EARLY, and this is the direction the whole scheme is built to
+be wrong in** -- an under-decref delays a finalizer, an over-decref runs one
+while the object is still in use:
+
+* a value held only by a TEMPORARY that was passed into a call -- `f(Foo())`,
+  or a deref's result read by anything but `is` -- dies when the enclosing
+  frame ends rather than at the end of the statement. Retiring those
+  temporaries needs every callee to be known not to keep what it is handed;
+  `ir/interpreter.py`'s `_NON_RETAINING` is that list, and it holds exactly
+  the names whose bodies have been read.
+* a value held only by a TUPLE. A tuple handle is not reference-counted at
+  all (`_INTERNED` deliberately does not intern tuples, so nothing ever
+  decrefs one), so a tuple neither keeps its elements alive nor releases
+  them; they answer to whatever else holds them.
+* a value held only by a CLOSURE CELL. `apy_cell_set` does not incref what it
+  stores, the one heap-mutation site left unhooked.
+* the ORDER of several objects finalized at the same moment -- a frame's
+  locals at return, a list's elements when the list dies. CPython's own order
+  is an implementation detail of its deallocator; this walks its own.
+* a reference CYCLE, which needs `gc.collect()` -- not yet built. CPython
+  leaves cycles to the same separate mechanism, so a program that never calls
+  it sees the same thing either way.
+
 ## Rebuilt so far
 
 | module | coverage |
@@ -119,6 +164,7 @@ rather than a bundled module, and is unaffected.
 | `statistics` | `mean`, `fmean` (`weights=`), `geometric_mean`, `harmonic_mean` (`weights=`), `median`/`median_low`/`median_high`/`median_grouped`, `mode`, `multimode`, `variance`/`pvariance`, `stdev`/`pstdev`, `quantiles` (exclusive/inclusive), `covariance`, `correlation` (linear/ranked), `linear_regression`, `NormalDist` (full surface, including `pdf`/`cdf`/`inv_cdf`/`samples`/`from_samples` and arithmetic). `mean`/`variance`/`stdev`/`harmonic_mean` sum exactly through `Fraction` (CPython's own private `_sum`/`_ss`, ported) rather than a naive float loop, and `stdev`/`pstdev` finish with a correctly-rounded rational square root rather than double-rounding. NOT `Decimal` interop, `NormalDist.overlap`, `kde`/`kde_random` -- each needs a transcendental function this runtime does not have. |
 | `datetime` | `timedelta` (all seven constructor keywords, CPython's exact normalization, full arithmetic/comparison), `date` (construction, `.today`/`.fromordinal`/`.fromtimestamp`, `.weekday`/`.isocalendar`, `.isoformat`/`.strftime` for the common directives, `.replace`, arithmetic, comparison including against `datetime`), `time` (construction incl. `tzinfo`/`fold`, `.isoformat` with every timespec, naive/aware comparison), `timezone` (fixed-offset only, a real `utc` singleton), `datetime` (`.now`/`.utcnow`/`.fromtimestamp`, `.combine`, `.timestamp`, `.astimezone`, `.strftime`/`.strptime`, arithmetic, comparison). NOT `zoneinfo`/real IANA timezones, `fromisoformat`, `ctime`, `__format__`, pickling; there is no host timezone lookup, so a naive `now()`/`fromtimestamp()` treats local time as UTC. |
 | `traceback` | `format_exception_only`, `format_exception`, `print_exception`, `format_tb`/`print_tb`, `extract_tb`, `StackSummary`, `FrameSummary`, `TracebackException`/`.from_exception` -- exception chaining (`raise X from Y`, implicit `__context__`, `from None`), `__notes__`, and the ONE real frame `e.__traceback__` carries. NOT `format_exc`/`print_exc` -- there is no `sys.exc_info`; a bare `raise` resolves at COMPILE TIME against a lexical stack of enclosing `except` blocks rather than runtime thread state, so these are refused as fundamentally unimplementable rather than merely unwritten -- `walk_tb`/`walk_stack`/`extract_stack`/`format_stack`/`print_stack` (no call stack to walk), quoted source lines (`co_filename` is always `<compiled>`), `SyntaxError`'s multi-line format, `BaseExceptionGroup`'s tree format. |
+| `weakref` | `ref(obj)` and `ref(obj, callback)`, calling a ref to get the referent or `None`, the interning of callback-free refs (`ref(o) is ref(o)`, as CPython interns them), `__eq__`/`__hash__`, `getweakrefcount`, and the `TypeError` for a target that cannot be weakly referenced. The callback fires when the referent's last reference drops and receives the REF, per CPython's convention. INTERPRETER-ONLY: it reads the shadow reference count below, which a compiled build does not keep, so its two primitives refuse BY NAME there. NOT `proxy`, `finalize`, `WeakValueDictionary`, `WeakKeyDictionary`, `WeakSet` -- each refused BY NAME, and each for its own reason (see the module docstring). |
 | `typing` | `TypeVar`, `Generic` with a real `__class_getitem__` (`.__origin__`/`.__args__`), `NewType`, `cast`, `overload`, `Protocol` + `runtime_checkable` (structural `isinstance`), `get_type_hints` (built on `annotationlib`), `NamedTuple`/`TypedDict` in the FUNCTIONAL FORM only. Everything annotation-only (`Any`, `Union`, `Optional`, `Callable`, `Literal`, `Annotated`, `ParamSpec`, `final`, `override`, `get_origin`, `get_args`, ...) stays on the native `_TYPING` table, unchanged -- a bundled member always wins over the native table entry for the same name, so the two coexist without conflict. NOT class-based `NamedTuple`/`TypedDict` or attribute-only `Protocol` members, refused BY NAME: an annotation-only class-body statement never reaches a custom metaclass's `__new__` in this frontend, since the PEP 649 thunk is wired onto the class object only after the class statement completes. |
 
 **Restoring is not free, and that is the point of stating coverage.** Three of

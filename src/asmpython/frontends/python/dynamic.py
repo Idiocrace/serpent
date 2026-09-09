@@ -225,6 +225,20 @@ def _hostsvc_names():
 #: of a name list is the thing that has drifted in this project three times.
 _HOSTSVC_NAMES = frozenset(_hostsvc_names())
 
+#: `apy_*` object-runtime primitives a bundled DYNAMIC module may call by
+#: bare name -- an EXPLICIT, SMALL allowlist, not every name
+#: `OBJECT_RUNTIME` (`analysis.py`) declares. Those hundreds of names take
+#: and return the shapes the STATIC/machine-subset frontend works in
+#: (unboxed ints, raw addresses); a dynamic value is already an `apy_value`
+#: `ptr` with no unboxing needed ONLY for a primitive whose whole signature
+#: is `ptr`s, which is true of these and is not a safe assumption to make
+#: about the rest without checking each one. Grown as a bundled module
+#: needs a new one, the same way `weakref.py` needed these two.
+_OBJRT_DYNAMIC_NAMES = frozenset({
+    "apy_weakref_register", "apy_weakref_deref", "apy_weakref_count",
+    "apy_weakref_existing",
+})
+
 _BUILTIN_TYPE_VALUES = frozenset({
     "int", "float", "bool", "str", "bytes", "list", "tuple", "dict", "set",
     "frozenset"})
@@ -1807,6 +1821,22 @@ class DynamicLowering:
         self._dyn_check()
         return self.b.call(T.PTR, "apy_from_int", [out])
 
+    def _dyn_objrt_call(self, node: ast.Call, name: str) -> int:
+        """One of `_OBJRT_DYNAMIC_NAMES`, called by bare name from a
+        bundled dynamic module.
+
+        NO CONVERSION, unlike `_dyn_hostsvc_call`: every argument and the
+        result are `ptr` (an `apy_value` handle) on both sides, which is
+        already what `_dyn_expr` produces for an ordinary dynamic
+        expression -- the whole reason this list is an explicit allowlist
+        rather than every `OBJECT_RUNTIME` name (most of which are NOT
+        this shape) is so that stays true without checking each one.
+        """
+        args = [self._dyn_expr(arg) for arg in node.args]
+        out = self.b.call(T.PTR, name, args)
+        self._dyn_check()
+        return out
+
     def _dyn_call(self, node: ast.Call) -> int:
         # `getattr` AND NOT `self.info.ctypes_calls`. A comprehension and a
         # lambda are lowered against a `_Synthetic` info that carries only
@@ -1825,6 +1855,14 @@ class DynamicLowering:
             # `ctypes` where the signature comes from the program's own
             # `argtypes`.
             return self._dyn_hostsvc_call(node, node.func.id)
+        if isinstance(node.func, ast.Name) \
+                and node.func.id in _OBJRT_DYNAMIC_NAMES \
+                and self.info.locals.get(node.func.id) is None:
+            # See `_OBJRT_DYNAMIC_NAMES`'s own comment -- the small,
+            # explicit set of object-runtime primitives safe to reach by
+            # bare name from dynamic code, recognised the same way a host
+            # service is.
+            return self._dyn_objrt_call(node, node.func.id)
         if (isinstance(node.func, ast.Name) and node.func.id == "dict"
                 and not node.args and node.keywords
                 and "dict" not in self.info.locals):

@@ -274,6 +274,24 @@ def _object_runtime() -> dict:
 #: to start than to compile.
 OBJECT_RUNTIME = _object_runtime()
 
+#: `apy_*` object-runtime primitives a bundled DYNAMIC module may call by
+#: bare name. See `dynamic.py`'s `_OBJRT_DYNAMIC_NAMES` -- the same small,
+#: explicit set (duplicated rather than imported, the same relationship
+#: `dynamic.py`'s own `_HOSTSVC_NAMES` already has with this file's
+#: `HOSTSVC`: each side reads what it needs from the source of truth,
+#: `objects/csource.py`'s signatures by way of `OBJECT_RUNTIME` here).
+#: Every argument and the result are `ptr`, checked once, here, rather
+#: than trusted per name -- see `_dyn_objrt_call`'s own comment for why
+#: that has to stay true for every name added to this set.
+_OBJRT_DYNAMIC_NAMES = frozenset({
+    "apy_weakref_register", "apy_weakref_deref", "apy_weakref_count",
+    "apy_weakref_existing",
+})
+assert _OBJRT_DYNAMIC_NAMES <= OBJECT_RUNTIME.keys()
+assert all(all(t is PTR for t in args) and ret is PTR
+          for name in _OBJRT_DYNAMIC_NAMES
+          for args, ret in [OBJECT_RUNTIME[name]])
+
 #: What the module's top-level statements are called internally. Not a legal
 #: Python identifier, so it can never collide with a user function -- including
 #: one actually named `main`, which stays an ordinary function that the entry
@@ -3610,6 +3628,24 @@ class Analyzer:
             # what the surrounding dynamic code receives is an object like
             # every other value it handles -- and claiming INT here made the
             # analyser reject the assignment that stores it.
+            return OBJ
+        if name in _OBJRT_DYNAMIC_NAMES and name not in self.functions \
+                and name not in self.current.locals:
+            # THE SAME GAP `HOSTSVC` HAS JUST ABOVE, for the small,
+            # explicit set of object-runtime primitives a bundled dynamic
+            # module is allowed to call by bare name -- see
+            # `_OBJRT_DYNAMIC_NAMES`'s own comment. Every one of them
+            # takes and returns `ptr`, which is already an ordinary
+            # dynamic value's own representation, so unlike `HOSTSVC`
+            # there is no boxing/unboxing question here at all.
+            want = len(OBJECT_RUNTIME[name][0])
+            if not any(isinstance(a, ast.Starred) for a in node.args) \
+                    and len(node.args) != want:
+                self._error("E0054",
+                            f"{name}() takes exactly {want} argument(s), "
+                            f"got {len(node.args)}", node)
+            for a in node.args:
+                self._arg_expr(a)
             return OBJ
         info = self.functions.get(name)
         if info is None:

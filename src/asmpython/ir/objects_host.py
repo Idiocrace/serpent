@@ -312,9 +312,22 @@ class ObjectHost:
         #: "alive" as far as this table is concerned, same as CPython
         #: effectively treats a small int or an interned string.
         self._refcount: dict[int, int] = {}
-        #: handle -> list of `_WeakrefRecord`, registered against it. See
-        #: `_apy_weakref_new`.
-        self._weakrefs: dict[int, list] = {}
+        #: target handle -> list of `(ref_self, callback)`, one entry per
+        #: `weakref.ref(target, callback)` created against it -- `ref_self`
+        #: is the `weakref.ref` INSTANCE's own handle (what a callback
+        #: receives, per CPython's convention), `callback` its handle or 0
+        #: for none. See `_apy_weakref_register`/`_apy_weakref_deref`.
+        self._weakrefs: dict[int, list[tuple[int, int]]] = {}
+        #: `ref_self` handle -> its target's handle, the REVERSE of (the
+        #: keys of) `_weakrefs`. Purely host-side bookkeeping, never
+        #: touched by `_attr_store`/`incref`/`decref` -- which is the
+        #: point: a `weakref.ref` instance storing its target as an
+        #: ordinary Python attribute (`self._target = obj`) would incref
+        #: it like any other attribute, making the "weak" reference a
+        #: strong one and defeating the entire feature. Looked up by
+        #: `apy_weakref_deref`, keyed by the `ref` instance's OWN handle
+        #: rather than anything stored inside it.
+        self._weakref_target: dict[int, int] = {}
         #: Handles currently inside `_finalize`, so a `__del__` that reaches
         #: back into its own object (directly, or through the cascade this
         #: object's own decref triggers) neither recurses nor runs twice.
@@ -448,6 +461,31 @@ class ObjectHost:
             return
         self._finalize_once(h)
 
+    def protect_handoff(self, h: int) -> None:
+        """Pin `h` across a RETURN -- `interpreter.py`'s frame teardown
+        calls this for the value being returned, just before dropping
+        this frame's own reference to it. Same mechanism as `_protect`,
+        named separately because the two call sites are answering
+        different questions and a reader tracing one should not have to
+        rule out the other.
+        """
+        self._protect(h)
+
+    def release_handoff(self, h: int) -> None:
+        """The returned value went NOWHERE -- a call whose result the
+        program discards (`f()` as a statement). `put()` calls this when
+        it has no destination register to store into, since nothing else
+        will ever lift the pin `protect_handoff` put on it, and a pin
+        nothing lifts is an object that never finalizes.
+
+        `_unprotect` rather than `settle`: this drops ONE layer and
+        re-checks the count, so a value that is ALSO under construction
+        somewhere up the stack keeps that separate pin, and a value whose
+        count really did reach zero finalizes here -- which is where
+        CPython finalizes a discarded temporary too.
+        """
+        self._unprotect(h)
+
     def settle(self, h: int) -> None:
         """`h` just found a real, counted home -- `interpreter.py`'s
         `put()` calls this right after its own `incref(h)`, when storing
@@ -481,6 +519,15 @@ class ObjectHost:
                     self._invoke_obj(m.bind(obj), [])
                 except _Trap:
                     raise
+                except _UserFailed:
+                    # The flag is already set; the report below is what
+                    # this does with it. `_invoke_obj` RAISES rather than
+                    # returning on a failed call, so without this the
+                    # `__del__`'s own exception escaped `_finalize` --
+                    # out of whatever `decref` happened to be running --
+                    # instead of being swallowed the way the comment
+                    # below says it is.
+                    pass
                 # A `__del__` THAT FAILS IS REPORTED AND SWALLOWED, exactly
                 # as CPython's does (`Exception ignored in: <bound method
                 # ...__del__...>`) -- to stderr, never stdout, so it never
@@ -494,15 +541,38 @@ class ObjectHost:
                     print(f"Exception ignored in: {obj!r}.__del__\n"
                          f"{kind}: {msg}", file=sys.stderr)
                 self.err, self.err_value = saved_err, saved_val
-        for callback in self._weakrefs.pop(h, ()):
-            if callback is not None:
+        for ref_self, callback in self._weakrefs.pop(h, ()):
+            if callback and ref_self not in self._dead:
+                # `ref_self not in self._dead`: the weakref OBJECT itself
+                # (a bundled `weakref.ref` instance) is tracked like any
+                # other, and can die before its own target does -- nothing
+                # left holding it, `del r`. CPython does not fire a
+                # callback for a `ref` that no longer exists to pass to
+                # it, and neither does this.
                 saved_err, saved_val = self.err, self.err_value
                 self.err = None
                 self.err_value = None
                 try:
-                    self._invoke_obj(callback, [])
+                    # THE CALLBACK RECEIVES THE WEAKREF, not the (now
+                    # gone) target -- CPython's own convention
+                    # (`weakref.ref(obj, callback)`'s docs: "the weak
+                    # reference object will be passed as the only
+                    # parameter"), and the only object left to pass.
+                    #
+                    # DEREFERENCED, both of them: `_weakrefs` stores
+                    # HANDLES (an `apy_value` is what the primitive was
+                    # handed), and `_invoke` takes host VALUES -- passing
+                    # the raw ints reached `f.bound` on an `int` and took
+                    # the whole interpreter down with an AttributeError.
+                    self._invoke(self._cells[callback],
+                                 [self._cells[ref_self]])
                 except _Trap:
                     raise
+                except _UserFailed:
+                    # The callback's own failure is already on the error
+                    # flag, and is reported and swallowed below exactly as
+                    # a failing `__del__` is -- see that comment.
+                    pass
                 if self.err is not None:
                     kind, msg = self.err
                     print(f"Exception ignored in weakref callback\n"
@@ -2689,8 +2759,20 @@ def _apy_seq_push(h, a):
     seq = h._get(a[0], "apy_seq_push")
     item = h._get(a[1], "apy_seq_push")
     if isinstance(seq, tuple):
+        # NO INCREF FOR A TUPLE, unlike the list below, and the asymmetry
+        # is forced: a tuple handle is not refcount-tracked at all (see
+        # `_INTERNED` -- tuples are deliberately not interned, so `_new`
+        # never gives one a `_refcount` entry and `_referent` never finds
+        # one), which means nothing ever decrefs a tuple, which means an
+        # incref here would have no counterpart ANYWHERE and would pin
+        # every element of every tuple for the run. Measured: with it,
+        # `a, b = self(), other()` -- an ordinary unpacking, which builds
+        # a tuple -- permanently pinned both values, and a `weakref`'s
+        # own `__eq__` stopped its referents from ever dying. The
+        # consequence of leaving it out is the opposite gap, documented
+        # in `docs/STDLIB.md`: an object held ONLY by a tuple is not kept
+        # alive by it.
         h._cells[int(a[0])] = seq + (item,)
-        h.incref(int(a[1]))
         return h._none
     if not isinstance(seq, list):
         return h._fail(
@@ -8923,6 +9005,112 @@ def _apy_bytes_literal(h, a):
 
 
 _TABLE["apy_bytes_literal"] = _apy_bytes_literal
+
+
+def _apy_weakref_register(h, a):
+    """`weakref.ref(target, callback=None).__init__`'s own primitive.
+
+    `a[0]` is the TARGET being weakly referenced; `a[1]` is the `ref`
+    INSTANCE itself (`self`, from the bundled class's own `__init__`) --
+    kept only to hand to `callback` later, exactly as CPython passes the
+    weakref object itself, not the (by then gone) target; `a[2]` is
+    `callback`'s handle -- ITSELF, not `0`, for "none": `callback=None`
+    reaches here as `h._none`'s own handle (a real, non-zero cell, like
+    every `None` in this runtime), not the literal `0` a bare truthiness
+    check on the handle would need. Normalised to `0` here, once, so
+    `_finalize`'s firing loop can keep using a plain truthiness check.
+
+    THE TARGET IS RECORDED ONLY IN `_weakref_target`, never as an
+    ordinary Python attribute on the `ref` instance (`self._target =
+    obj` in the bundled class would have `_attr_store` incref it like
+    any other stored attribute, making a WEAK reference hold a STRONG
+    one and keeping every referent alive forever -- measured directly:
+    the first version of this module did exactly that, and `del a`
+    after `weakref.ref(a)` stopped finalizing `a` at all, not even
+    late).
+    """
+    target = int(a[0])
+    if target not in h._refcount:
+        return h._fail("TypeError",
+                       f"cannot create weak reference to "
+                       f"'{h.kind_name(h._get(target, 'weakref'))}' object")
+    callback = int(a[2])
+    if callback == h._none:
+        callback = 0
+    ref_self = int(a[1])
+    if ref_self in h._weakref_target:
+        # ALREADY REGISTERED, and this is not a mistake: `ref.__new__`
+        # hands back an existing callback-free `ref` for the same target
+        # (CPython interns those -- `ref(o) is ref(o)`), and returning an
+        # instance OF THE CLASS from `__new__` means `__init__` runs on
+        # it a second time. Idempotent here rather than guarded there,
+        # so the bundled module does not need a second flag attribute
+        # whose only job is to remember this.
+        return h._none
+    h._weakrefs.setdefault(target, []).append((ref_self, callback))
+    h._weakref_target[ref_self] = target
+    return h._none
+
+
+_TABLE["apy_weakref_register"] = _apy_weakref_register
+
+
+def _apy_weakref_deref(h, a):
+    """`weakref.ref.__call__`'s own primitive -- the live target, or
+    `None` once `_finalize` has run for it. `a[0]` is the `ref`
+    INSTANCE's own handle (`self`), looked up in `_weakref_target`
+    rather than read off a stored attribute -- see
+    `_apy_weakref_register`'s own comment for why there is no such
+    attribute to read.
+
+    `_dead`, not a refcount read, is the right question for the
+    TARGET: a handle whose count is transiently at zero while
+    `_protect`ed has not actually finalized yet, and CPython's own
+    weakref does not go dead until the object really is gone.
+    """
+    target = h._weakref_target.get(int(a[0]))
+    if not target or target in h._dead:
+        return h._none
+    return target
+
+
+_TABLE["apy_weakref_deref"] = _apy_weakref_deref
+
+
+def _apy_weakref_existing(h, a):
+    """The live, CALLBACK-FREE `weakref.ref` already pointing at `a[0]`,
+    or `None`.
+
+    CPython INTERNS these: `ref(o) is ref(o)` is True, and
+    `getweakrefcount(o)` counts one, because the second call hands back
+    the first object rather than building a second. A `ref` WITH a
+    callback is never shared -- two callbacks both have to run -- which
+    is why only the callback-free ones are looked up here.
+    """
+    target = int(a[0])
+    for ref_self, callback in h._weakrefs.get(target, ()):
+        if not callback and ref_self not in h._dead:
+            return ref_self
+    return h._none
+
+
+_TABLE["apy_weakref_existing"] = _apy_weakref_existing
+
+
+def _apy_weakref_count(h, a):
+    """`weakref.getweakrefcount(obj)` -- how many live `ref`s point at
+    `obj`. `0` for a handle nothing tracks, matching CPython's own
+    `getweakrefcount` on an object that cannot be weakly referenced at
+    all, rather than raising over a question with an obvious answer.
+    """
+    target = int(a[0])
+    if target not in h._refcount:
+        return h._int(0)
+    return h._int(sum(1 for ref_self, _ in h._weakrefs.get(target, ())
+                      if ref_self not in h._dead))
+
+
+_TABLE["apy_weakref_count"] = _apy_weakref_count
 
 
 def _apy_str_bytes(h, a):
