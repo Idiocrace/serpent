@@ -4691,6 +4691,27 @@ def _apy_pow3(h, a):
 def _apy_divmod(h, a):
     x = h._get(a[0], "apy_divmod")
     y = h._get(a[1], "apy_divmod")
+    # `__divmod__`/`__rdivmod__`, the same explicit direct-then-reflected
+    # shape `_binop`'s `_OP_DUNDER` loop uses for `+`/`-`/`*`/... -- but
+    # `divmod()` is a BUILTIN rather than an operator, so it was never
+    # routed through that table, and a class defining `__divmod__`
+    # (`bundled/datetime.py`'s `timedelta`, for `divmod(td, other_td)`)
+    # got "unsupported operand type(s) for divmod(): 'Instance' and
+    # 'Instance'" -- naming this file's own class, about two objects that
+    # plainly define the method being asked for. The same miss `_apy_abs`
+    # above already guards against for `__abs__`.
+    if isinstance(x, Instance) or isinstance(y, Instance):
+        for who, other, which in ((x, y, "__divmod__"),
+                                  (y, x, "__rdivmod__")):
+            if not isinstance(who, Instance) or who.cls.find(which) is None:
+                continue
+            got = _user(h, lambda who=who, other=other, which=which:
+                       who._send(which, other), fail=_FAILED)
+            if got is _FAILED:
+                return 0
+            if got is not NotImplemented:
+                return h._value(got)
+        return h._binop_error("divmod()", x, y)
     bad = _reject(h, "divmod()", x, y)
     if bad is not None:
         return bad
@@ -4698,7 +4719,13 @@ def _apy_divmod(h, a):
         q, r = divmod(x, y)
     except ZeroDivisionError:
         return h._fail("ZeroDivisionError", "division by zero")
-    return h._new((h._value(q), h._value(r)))
+    # RAW VALUES, not handles: a tuple object's Python-level body holds the
+    # elements themselves (see `Interpreter._text`'s container branch, and
+    # `Iterator.ENUMERATE` just below building `(at, v)` the same way) --
+    # `h._value()` mints a HANDLE, and wrapping each element in one before
+    # `h._new` double-boxed them, so reading the tuple back printed the
+    # handle's cell INDEX instead of the quotient/remainder it pointed to.
+    return h._new((q, r))
 
 
 def _apy_bit_length(h, a):
