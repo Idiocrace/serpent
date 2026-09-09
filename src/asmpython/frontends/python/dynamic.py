@@ -5348,25 +5348,22 @@ class DynamicLowering:
             # `"{} {k}".format(a, k=v)`. The positional arguments travel as a
             # TUPLE and the keyword ones as a dict, because the format string
             # decides at run time which of them each field wants.
-            packed = self.b.call(T.PTR, "apy_tuple_new",
-                                 [self.b.const(T.I64, len(node.args) + 1)])
-            for a in node.args:
-                self.b.call(T.PTR, "apy_seq_push", [packed, self._dyn_expr(a)])
-            named = self.b.call(T.PTR, "apy_dict_new",
-                                [self.b.const(T.I64,
-                                              len(node.keywords) + 1)])
-            for kw in node.keywords:
-                if kw.arg is None:
-                    self.b.call(T.PTR, "apy_update",
-                                [named, self._dyn_expr(kw.value)])
-                else:
-                    self.b.call(T.PTR, "apy_dict_set",
-                                [named, self._dyn_str_literal(kw.arg),
-                                 self._dyn_expr(kw.value)])
-            out = self.b.call(T.PTR, "apy_str_format",
-                              [receiver, packed, named])
-            self._dyn_check()
-            return out
+            #
+            # `format` IS NOT IN `methods.py`, so it never reaches the
+            # name-collision test below on its own -- this call was ALWAYS
+            # `apy_str_format`, for any receiver, which answered a wrong
+            # result rather than a missing one for a program defining its
+            # own `format` method (`string.Formatter` is exactly this: a
+            # class whose entire purpose is a `.format` a program calls).
+            # So the same collision question the generic path asks for
+            # `add`/`keys`/etc is asked here too, by hand, because `format`
+            # skips that path entirely; a module with no such method still
+            # takes the direct call below and pays nothing extra.
+            if "format" in self.user_method_names:
+                return self._dyn_format_either(receiver, node.args,
+                                               node.keywords)
+            return self._dyn_str_format_call(receiver, node.args,
+                                             node.keywords)
         args = self._dyn_operands(node.args)
         sym = method_symbol(attr, len(args))
         if sym is not None and (attr in self.user_method_names
@@ -5561,6 +5558,75 @@ class DynamicLowering:
                 self.b.call(T.PTR, "apy_method_self",
                             [receiver, self._dyn_str_literal(attr)]),
                 attr, args, sym, keywords)]))
+        self.b.jump(done)
+
+        self.b.switch_to(done)
+        return out
+
+    def _dyn_str_format_call(self, receiver: int, arg_nodes: list,
+                             keyword_nodes: list) -> int:
+        """`recv.format(a, k=v)` as `str.format` reads it: positional
+        arguments packed into a tuple, keywords into a dict, because the
+        format string decides at run time which of them each field wants.
+        Factored out of `_dyn_method` so `_dyn_format_either` below can put
+        it behind a run-time test instead of always emitting it."""
+        packed = self.b.call(T.PTR, "apy_tuple_new",
+                             [self.b.const(T.I64, len(arg_nodes) + 1)])
+        for a in arg_nodes:
+            self.b.call(T.PTR, "apy_seq_push", [packed, self._dyn_expr(a)])
+        named = self.b.call(T.PTR, "apy_dict_new",
+                            [self.b.const(T.I64, len(keyword_nodes) + 1)])
+        for kw in keyword_nodes:
+            if kw.arg is None:
+                self.b.call(T.PTR, "apy_update",
+                            [named, self._dyn_expr(kw.value)])
+            else:
+                self.b.call(T.PTR, "apy_dict_set",
+                            [named, self._dyn_str_literal(kw.arg),
+                             self._dyn_expr(kw.value)])
+        out = self.b.call(T.PTR, "apy_str_format", [receiver, packed, named])
+        self._dyn_check()
+        return out
+
+    def _dyn_format_either(self, receiver: int, arg_nodes: list,
+                           keyword_nodes: list) -> int:
+        """`.format(...)` for the one call site `_dyn_method_either` cannot
+        cover: `format` is not a name `methods.py` knows, so there is no
+        `sym` for `_dyn_builtin_method` to dispatch through on the builtin
+        side. Same shape anyway -- `apy_method_is_builtin` asks the CLASS
+        first, so an instance of a class defining its own `format`
+        (`string.Formatter`) always takes the user branch, and a plain
+        `str`, which is not an instance at all, always takes the other.
+        """
+        out = self.b.reg(T.PTR)
+        user = self.b.new_block("fmtusermethod")
+        builtin = self.b.new_block("fmtbuiltinmethod")
+        done = self.b.new_block("fmtmethodend")
+        is_builtin = self.b.call(T.I64, "apy_method_is_builtin",
+                                 [receiver, self._dyn_str_literal("format")])
+        self.b.branch(self.b.cmp(Op.NE, T.I64, is_builtin,
+                                 self.b.const(T.I64, 0)), builtin, user)
+
+        self.b.switch_to(user)
+        found = self.b.call(T.PTR, "apy_getattr",
+                            [receiver, self._dyn_str_literal("format")])
+        self._dyn_check()
+        args = self._dyn_operands(arg_nodes)
+        self.b.emit(Instruction(
+            Op.COPY, T.PTR, dst=out,
+            args=[self._dyn_indirect(found, args, keyword_nodes)]))
+        self.b.jump(done)
+
+        self.b.switch_to(builtin)
+        # UNWRAPPED FIRST, as `_dyn_method_either` does -- a class extending
+        # `str` reaching `apy_str_format` has to arrive as the str it
+        # carries, not as the instance wrapping it.
+        unwrapped = self.b.call(T.PTR, "apy_method_self",
+                                [receiver, self._dyn_str_literal("format")])
+        self.b.emit(Instruction(
+            Op.COPY, T.PTR, dst=out,
+            args=[self._dyn_str_format_call(unwrapped, arg_nodes,
+                                            keyword_nodes)]))
         self.b.jump(done)
 
         self.b.switch_to(done)
