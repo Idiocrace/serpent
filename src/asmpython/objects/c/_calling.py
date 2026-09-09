@@ -1338,6 +1338,30 @@ APY_API apy_value apy_call_spread(apy_value f, apy_value args) {
    Used to flatten a starred argument into the list a spread call builds. */
 APY_API apy_value apy_extend(apy_value seq, apy_value other) {
     int64_t i;
+    /* BYTES ON THE END OF A BYTEARRAY -- the other half of what
+       `apy_seq_push` gained, and missing for the same reason. Handled
+       before `apy_iterable` because a `bytes` argument is the common case
+       and walking it element by element would push ints through the same
+       one-byte reallocation each time. */
+    if (O(seq)->kind == APY_BYTES_K && O(seq)->v.s.mut) {
+        apy_value add = apy_to_bytes(other);
+        int64_t n, m;
+        char *buf;
+        if (!add)
+            return apy_fail2("TypeError",
+                             "can't extend bytearray with %s%s",
+                             apy_kind_name(other), "");
+        n = O(seq)->v.s.n;
+        m = O(add)->v.s.n;
+        buf = (char *)malloc((size_t)(n + m) + 1);
+        if (!buf) return apy_fail("MemoryError", "out of memory");
+        if (n) memcpy(buf, O(seq)->v.s.p, (size_t)n);
+        if (m) memcpy(buf + n, O(add)->v.s.p, (size_t)m);
+        buf[n + m] = 0;
+        O(seq)->v.s.p = buf;
+        O(seq)->v.s.n = n + m;
+        return apy_none();
+    }
     /* Drain anything that is iterable but not indexable -- a generator, a
        user object with `__iter__` -- so `[*gen]` and `f(*gen)` work. Both
        walks below are by index and neither can step a cursor. */

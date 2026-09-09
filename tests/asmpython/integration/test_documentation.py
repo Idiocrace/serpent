@@ -588,3 +588,54 @@ def test_the_frontend_is_not_a_subset(what: str, source: str,
     assert result.ok, (
         f"{what} does not compile, so the frontend really is a subset: "
         + "; ".join(f"{d.code}: {d.message}" for d in sink.diagnostics))
+
+
+def _library_modules() -> set[str]:
+    """The bundled modules that are LIBRARY, not the Python-in-Python
+    compiler. `_pyast` and friends are spliced by the same machinery and
+    that is all they have in common with `functools` -- `docs/STDLIB.md`
+    says so under "What is not the standard library"."""
+    from asmpython.frontends.python import bundled
+    return {n for n in bundled.available() if not n.startswith("_py")}
+
+
+def _documented_modules() -> set[str]:
+    """Every module named in `STDLIB.md`'s coverage table.
+
+    THE TABLE IS THE DELIVERABLE, per that document's own opening: "this
+    time the coverage is the deliverable, and it is stated per module". A
+    row is `| \\`name\\` | what it covers |`, and the qualifier some rows
+    carry (`sys` (`getrefcount`)) is dropped so the module is what is
+    compared.
+    """
+    text = _doc("docs/STDLIB.md").read_text(encoding="utf-8")
+    return set(re.findall(r"^\| `([a-z_][\w.]*)`(?: \(`\w+`\))? \|", text,
+                          re.M))
+
+
+def test_every_bundled_module_has_a_coverage_row() -> None:
+    """A module nobody documented is a module nobody can predict.
+
+    THE DOCUMENT'S OWN ARGUMENT, applied to itself: the previous library
+    was archived because "nothing records which half of anything is
+    there", and a table that silently stops covering new modules is that
+    problem coming back. `socket`, `select`, `threading` and `subprocess`
+    all arrived at once; a row for each is what makes them findable.
+    """
+    have, documented = _library_modules(), _documented_modules()
+    assert not have - documented, (
+        "bundled with no row in docs/STDLIB.md: " + str(sorted(have - documented)))
+
+
+def test_every_bundled_module_has_a_differential_test() -> None:
+    """And a claim nobody measured is a claim.
+
+    `tests/stdlib/<module>.py` is what turns a coverage row from a
+    sentence into something CPython disagrees with when it is wrong --
+    see that suite's own docstring. A module with a row and no test has
+    the sentence and not the check.
+    """
+    have = _library_modules()
+    tested = {p.stem for p in (ROOT / "tests" / "stdlib").glob("*.py")}
+    assert not have - tested, (
+        "bundled with no tests/stdlib case: " + str(sorted(have - tested)))

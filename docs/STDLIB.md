@@ -188,13 +188,17 @@ while the object is still in use:
   maintained well enough to cascade from -- `_invoke_obj` pins and unpins a
   closure around every call to it, and that unpin found the count at zero.
   So a captured value outlives the closure that captured it.
-* anything in a function containing a LOOP. `_analyze` retires a temporary
-  at its last STATIC read, which is only the last dynamic one when the
-  function has no back edge, so a loop switches the whole optimisation off
-  for that function and every temporary in it waits for frame teardown.
-  What that is usually visible as is ORDER rather than lateness: `for it in
-  items` leaves `it` holding the last element, so that one outlives the
-  list and its `__del__` runs after the others' instead of first.
+* a temporary in a function with a LOOP whose reads are not all in the same
+  basic block as its write. A back edge means "last STATIC read" is not
+  "last dynamic read", so retiring one is only sound where the value cannot
+  survive an iteration -- which a block-local register cannot, since a block
+  has no branches and the next pass writes a fresh value. Everything else in
+  such a function waits for frame teardown, and the compiler's own
+  bound-check lowering (a global load, a branch, then the use) puts a good
+  many ordinary temporaries on the wrong side of that line. What it is
+  usually visible as is ORDER rather than lateness: `for it in items` leaves
+  `it` holding the last element, so that one outlives the list and its
+  `__del__` runs after the others' instead of first.
 * the ORDER of a shutdown collection when several objects die together and
   one of them is also held by something the run over-held. Everything that
   should finalize does (see below); which of two `__del__`s prints first can
@@ -206,6 +210,14 @@ while the object is still in use:
   identically in both.
 
 ## Rebuilt so far
+
+**44 modules, and every one of them has a differential test.** Nothing is in
+the table below without a `tests/stdlib/<module>.py` that CPython 3.14 and
+asmpython both run to identical bytes, and nothing is in `bundled/` without
+a row here -- the two are checked against each other rather than kept in
+step by hand. The five tiers of the plan above are done; what is left is
+DEPTH inside modules that are present, and each row says exactly which
+depth it claims.
 
 | module | coverage |
 | --- | --- |

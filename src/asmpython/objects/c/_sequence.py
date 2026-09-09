@@ -416,7 +416,37 @@ static void apy_q_append(apy_value q, apy_value item) {
 /* Used both to BUILD a literal and to implement `list.append`. A tuple is
    built with it too and then never appended to again: immutability is a rule
    the frontend enforces, not a property of the cell. */
+/* GROW A BYTEARRAY BY ONE BYTE. `v.s` has no capacity field -- a str is
+   immutable and never needed one -- so this reallocates on every append,
+   which is quadratic and is the honest trade against adding a field to
+   every string in the program. A caller building a large buffer builds it
+   with `+` and one copy instead. */
+static int apy_bytes_push(apy_value b, int byte) {
+    int64_t n = O(b)->v.s.n;
+    char *buf = (char *)malloc((size_t)n + 2);
+    if (!buf) return 0;
+    if (n) memcpy(buf, O(b)->v.s.p, (size_t)n);
+    buf[n] = (char)byte;
+    buf[n + 1] = 0;
+    O(b)->v.s.p = buf;
+    O(b)->v.s.n = n + 1;
+    return 1;
+}
+
 APY_API apy_value apy_seq_push(apy_value seq, apy_value item) {
+    /* A BYTEARRAY APPENDS AN INT. It was missing here and in the
+       interpreter both -- `.append` on the most ordinary way there is to
+       build one up answered "'bytearray' object has no attribute
+       'append'", which `bundled/subprocess.py` found. */
+    if (O(seq)->kind == APY_BYTES_K && O(seq)->v.s.mut) {
+        int64_t byte;
+        if (!apy_index_arg(item, &byte, APY_IDX_SUB)) return 0;
+        if (byte < 0 || byte > 255)
+            return apy_fail("ValueError", "byte must be in range(0, 256)");
+        if (!apy_bytes_push(seq, (int)byte))
+            return apy_fail("MemoryError", "out of memory");
+        return apy_none();
+    }
     if (!apy_is_seq(seq))
         return apy_fail2("AttributeError",
                          "'%s' object has no attribute 'append'%s",

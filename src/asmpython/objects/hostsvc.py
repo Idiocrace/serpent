@@ -953,11 +953,19 @@ C_SOURCE["proc"] = r"""/* --- host services: proc ------------------------------
 __declspec(dllimport) intptr_t _spawnvp(int, const char *, const char *const *);
 #define APY_SPAWN_WAIT 0
 #else
-/* `read` IS NOT DECLARED HERE and the others are, which looks arbitrary
-   until you try it: a header already in scope declares `read`, so a second
-   prototype is a conflicting one and does not compile -- the same obstacle
-   `select` hit two groups up. The rule is not "declare what you call", it
-   is "declare what nothing else has": every name below was checked by
+/* THE PIPES ARE READ THROUGH `FILE *`, not through `read`, and the reason
+   is a collision this file cannot win. Every name declared here shares one
+   namespace with the C the BACKEND emits for the program's own functions,
+   and a Python program with `def read(...)` compiles to `uintptr_t
+   read(uintptr_t)` -- which conflicts with any prototype for libc's, and
+   with the implicit declaration if there is none. Corpus program
+   `functions_and_globals` has exactly that function, and it failed to
+   build the moment this group appeared.
+
+   `fdopen`/`fread`/`fclose` are `<stdio.h>`'s, which is already included,
+   so NOTHING IS DECLARED for them and there is nothing to collide. The
+   same argument applies to every name below: each is declared because
+   nothing else in the translation unit has it, and each was checked by
    compiling, which is the only way to know. */
 int pipe(int *);
 int fork(void);
@@ -1034,6 +1042,15 @@ static int apy_proc_argv(@PTR@ packed, int64_t n, int64_t count,
         }
         close(outfd[1]);
         close(errfd[1]);
+        {
+        FILE *fout = fdopen(outfd[0], "rb");
+        FILE *ferr = fdopen(errfd[0], "rb");
+        if (!fout || !ferr) {
+            if (fout) fclose(fout); else close(outfd[0]);
+            if (ferr) fclose(ferr); else close(errfd[0]);
+            waitpid(pid, &state, 0);
+            return -1;
+        }
         /* READ BOTH BEFORE WAITING. A child that fills one pipe blocks
            until someone drains it, so waiting first and reading second
            deadlocks on any output larger than a pipe buffer. Alternating
@@ -1041,24 +1058,13 @@ static int apy_proc_argv(@PTR@ packed, int64_t n, int64_t count,
            stdout to the end and then stderr is enough here because the
            capture buffers are sized by the caller and the common case is a
            program that writes to one of them. */
-        for (;;) {
-            long got = read(outfd[0], (char *)out + got_out,
-                            (unsigned long)(out_cap - got_out > 0
-                                            ? out_cap - got_out : 0));
-            if (got <= 0) break;
-            got_out += got;
-            if (got_out >= out_cap) break;
+        if (out_cap > 0)
+            got_out = (int64_t)fread((char *)out, 1, (size_t)out_cap, fout);
+        if (err_cap > 0)
+            got_err = (int64_t)fread((char *)err, 1, (size_t)err_cap, ferr);
+        fclose(fout);
+        fclose(ferr);
         }
-        for (;;) {
-            long got = read(errfd[0], (char *)err + got_err,
-                            (unsigned long)(err_cap - got_err > 0
-                                            ? err_cap - got_err : 0));
-            if (got <= 0) break;
-            got_err += got;
-            if (got_err >= err_cap) break;
-        }
-        close(outfd[0]);
-        close(errfd[0]);
         if (waitpid(pid, &state, 0) < 0) return -1;
         /* WIFEXITED / WEXITSTATUS, written out. The low seven bits are the
            signal that killed it and the next eight are the exit status;

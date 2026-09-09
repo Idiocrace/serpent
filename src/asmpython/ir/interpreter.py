@@ -56,11 +56,18 @@ class Frame:
     func: Function
     registers: dict[int, int | float] = field(default_factory=dict)
     frame_base: int = 0
-    #: Countdown of remaining STATIC reads for each `T.PTR` register in
-    #: this function, or `None` when the optimisation below is not in
-    #: effect for it (no object runtime, or the function contains a
-    #: loop -- see `Interpreter._analyze`). A fresh copy per call, since
-    #: it counts down over the course of ONE invocation.
+    #: Countdown of remaining STATIC reads, for each `T.PTR` register the
+    #: analysis will allow `_consume` to retire. A fresh copy per call,
+    #: since it counts down as the invocation runs, and RESET per write
+    #: from `budget` below, since the count belongs to the value rather
+    #: than to the register.
+    #:
+    #: WHICH REGISTERS ARE IN IT is `Interpreter._analyze`'s answer: all of
+    #: them for a function with no loop, and only the block-local ones for
+    #: a function with one -- see the long comment there. `None` only for a
+    #: `Frame` built outside `_call`, which nothing does; the guards in
+    #: `_consume` and `_would_consume` are there so that if something ever
+    #: does, it retires nothing rather than crashing.
     remaining: dict[int, int] | None = None
     #: Registers `_consume` must never retire early -- every parameter and
     #: every register ever assigned by `Op.COPY`, which is how a NAMED
@@ -82,6 +89,13 @@ class Frame:
     #: array. Per-invocation: the addresses come from `Memory.alloc` and
     #: differ between calls to the same function.
     allocas: list = field(default_factory=list)
+    #: `_analyze`'s ORIGINAL read count, to restore a register's budget in
+    #: `remaining` each time it is WRITTEN. Without that the count is per
+    #: INVOCATION, which is right for a straight-line function and wrong
+    #: inside a loop: a block-local temporary written afresh on every
+    #: iteration gets a new value each time and has to be allowed its
+    #: reads again. Shared across calls -- purely static, like `named`.
+    budget: dict = field(default_factory=dict)
 
 
 class Memory:
@@ -463,8 +477,12 @@ class Interpreter:
         # the time anything reaches it, is set.
         has_loop, read_count, named = self._analyze(fn)
         fr.named = named
-        if not has_loop:
-            fr.remaining = dict(read_count)
+        # ALWAYS A TABLE NOW. `_analyze` has already narrowed `read_count`
+        # to the block-local registers when the function has a loop, so
+        # what arrives here is exactly what may be retired -- and a
+        # function with a loop is no longer excluded wholesale.
+        fr.remaining = dict(read_count)
+        fr.budget = read_count
         for reg, val in zip(fn.params, args):
             fr.registers[reg] = val
             # A PARAMETER IS A NEW BINDING, same as `put()` treats any other
@@ -606,13 +624,49 @@ class Interpreter:
         has_loop = self._has_cycle(fn)
         read_count: dict[int, int] = {}
         named: set[int] = set(fn.params)
+        # WHERE EACH REGISTER IS WRITTEN AND READ, by block. Only wanted
+        # when there IS a loop -- see below -- but counting it always costs
+        # one pass over a function that is being walked anyway.
+        wrote: dict[int, set] = {}
+        read_in: dict[int, set] = {}
         for blk in fn.blocks:
             for ins in blk.instructions:
                 for reg in ins.args:
                     if fn.registers.get(reg) is T.PTR:
                         read_count[reg] = read_count.get(reg, 0) + 1
+                        read_in.setdefault(reg, set()).add(blk.label)
+                if ins.dst is not None:
+                    wrote.setdefault(ins.dst, set()).add(blk.label)
                 if ins.op is Op.COPY and ins.dst is not None:
                     named.add(ins.dst)
+        if has_loop:
+            # A LOOP DOES NOT HAVE TO DISABLE THE WHOLE FUNCTION, and it
+            # used to. `_consume` retires a register at its last STATIC
+            # read, which is the last DYNAMIC one only when no read can
+            # happen again -- and a back edge means one can, so every
+            # temporary in a function with a loop waited for frame
+            # teardown. That is most functions worth caring about.
+            #
+            # WHAT A BACK EDGE ACTUALLY BREAKS is a register whose value
+            # OUTLIVES an iteration: written before the loop, read inside
+            # it, retired on the first pass and gone on the second. A
+            # register written and read entirely within ONE BASIC BLOCK
+            # cannot be that: a block has no branches, so every one of its
+            # instructions runs on every visit, in order -- the last static
+            # read in the block IS the last dynamic read of the value that
+            # block's write produced. The next iteration writes a fresh
+            # value, and `put()` restores the read budget when it does (see
+            # `Frame.remaining`), so the count is per-value rather than per
+            # invocation.
+            #
+            # Everything else in the function stays excluded, which keeps
+            # this in the direction the scheme errs in: a register this
+            # cannot prove local simply waits for teardown, as all of them
+            # did before.
+            read_count = {reg: n for reg, n in read_count.items()
+                          if len(wrote.get(reg, ())) == 1
+                          and len(read_in.get(reg, ())) == 1
+                          and wrote[reg] == read_in[reg]}
         result = (has_loop, read_count, frozenset(named))
         self._fn_analysis[id(fn)] = result
         return result
@@ -868,6 +922,12 @@ class Interpreter:
                     # transient zero and finalize an object that is, by
                     # the end of this one assignment, exactly as alive as
                     # it was at the start.
+                    # A NEW VALUE MEANS NEW READS. See `Frame.budget`:
+                    # the countdown belongs to the VALUE in the register,
+                    # not to the register across the whole invocation, and
+                    # a loop writes a fresh one on every pass.
+                    if fr.remaining is not None and ins.dst in fr.budget:
+                        fr.remaining[ins.dst] = fr.budget[ins.dst]
                     if v:
                         self.objects.incref(v)
                         # LIFTS ANY `_instantiate`-STYLE PIN now that the
