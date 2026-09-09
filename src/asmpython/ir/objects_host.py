@@ -8245,8 +8245,19 @@ def _apy_set_discard(h, a):
 def _to_set(h, a, frozen: bool):
     v = h._get(a[0], "apy_to_set")
     if not isinstance(v, (list, tuple, set, frozenset, dict, str, range)):
-        return h._fail("TypeError",
-                       f"'{h.kind_name(v)}' object is not iterable")
+        # NOT ONE OF THE FAST CONTAINER TYPES -- which used to mean an
+        # outright refusal, so `frozenset(x for x in y)` failed with
+        # "'generator' object is not iterable" while `list(x for x in y)`
+        # worked: `list()`'s path already drains a generator (and any other
+        # iterable) through `_apy_iterable`/`_apy_gen_drain`, and `set()`/
+        # `frozenset()` had never been routed through the same machinery.
+        # Same funnel as `_apy_iterable`'s own class-extending-a-builtin
+        # comment describes: patching one caller and not this one just moves
+        # which builtin call reports the object as not iterable.
+        handle = _apy_iterable(h, a)
+        if h.err is not None:
+            return 0
+        v = h._get(handle, "apy_to_set")
     try:
         return h._new(frozenset(v) if frozen else set(v))
     except TypeError as exc:
