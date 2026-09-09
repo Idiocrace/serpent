@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import builtins
 import math
+import sys
 
 from . import types as _ir_types
 
@@ -293,6 +294,51 @@ class ObjectHost:
         #: `__context__`. One slot rather than a stack, matching the C.
         self.handling = None
 
+        # ── shadow reference counting ───────────────────────────────────────
+        #: OBSERVABLE object lifetime, not real memory management -- nothing
+        #: here is ever freed; the arena's own "leak forever" model
+        #: (`docs/INERT-RUNTIME.md`) is untouched. What this tracks is WHEN a
+        #: `__del__`/a `weakref` callback would fire and what
+        #: `sys.getrefcount` would answer, so a program that observes those
+        #: three things sees what CPython's program would show it.
+        #:
+        #: Keyed by handle, and populated ONLY for the INTERNED kinds
+        #: (`_INTERNED` below, plus the named classes `_new` interns) --
+        #: exactly the kinds `__del__`/`weakref` are ever meaningfully used
+        #: on. A plain int/str/float/tuple has no stable per-VALUE handle to
+        #: count against (`_new` mints a fresh one most of the time; see its
+        #: own docstring), and CPython's `__del__`/`weakref` story is about
+        #: OBJECTS, not scalars -- so those are left untracked, permanently
+        #: "alive" as far as this table is concerned, same as CPython
+        #: effectively treats a small int or an interned string.
+        self._refcount: dict[int, int] = {}
+        #: handle -> list of `_WeakrefRecord`, registered against it. See
+        #: `_apy_weakref_new`.
+        self._weakrefs: dict[int, list] = {}
+        #: Handles currently inside `_finalize`, so a `__del__` that reaches
+        #: back into its own object (directly, or through the cascade this
+        #: object's own decref triggers) neither recurses nor runs twice.
+        #: CPython's own GC has the same guard (`_PyGC_FINALIZED`).
+        self._finalizing: set = set()
+        #: Handles `_finalize_once` has already run for, permanently. A
+        #: SEPARATE guard from `_finalizing`: that one covers ONE call's
+        #: own recursion, this one covers two SEPARATE calls -- an extra,
+        #: erroneous `decref` landing on this handle again after it is
+        #: already at (or past) zero, from a bookkeeping bug elsewhere,
+        #: would otherwise run `__del__` a second time, which CPython
+        #: never does no matter how a refcount implementation gets there.
+        self._dead: set = set()
+        #: handle -> pin count. See `_protect`/`_unprotect`: a value that
+        #: exists only as a HOST Python local (not yet stored into any
+        #: register `put()` will incref) but is about to be handed to a
+        #: nested `_call` -- the receiver of a bound method, most of all a
+        #: `self` under construction -- would otherwise be observed
+        #: at its true, transient refcount of zero the moment that nested
+        #: call's own frame teardown drops its copy, finalizing something
+        #: still very much alive one level up. Pinning it holds `decref`
+        #: off; `_unprotect` replays the zero-check once the pin lifts.
+        self._protected: dict[int, int] = {}
+
     # ── the handle table ────────────────────────────────────────────────────
     #: Kinds whose handle is INTERNED, so `is` answers about the object rather
     #: than about which handle it came back through. The mutable containers
@@ -312,7 +358,211 @@ class ObjectHost:
                 "Instance", "Class", "Exc", "Func", "Gen", "Iterator",
                 "Alias"):
             self._identity.setdefault(id(obj), made)
+            # BORN AT ZERO. Every INCREF from here is a real, counted
+            # reference; nothing after this line double-counts the handle
+            # itself the way "start at 1 for the handle table's own entry"
+            # would -- `_cells` holding `obj` is bookkeeping, not a Python
+            # reference this scheme answers questions about.
+            self._refcount[made] = 0
         return made
+
+    # ── shadow reference counting ───────────────────────────────────────────
+    def incref(self, h: int) -> None:
+        """One more live reference to handle `h`.
+
+        A no-op for the null handle and for anything `_new` did not enrol
+        (a plain int/str/float/tuple/...) -- see `_refcount`'s own comment
+        for why those are out of scope. Safe to call on any handle for
+        exactly that reason: a caller never has to ask first whether `h` is
+        the kind of thing this tracks.
+        """
+        if h and h in self._refcount:
+            self._refcount[h] += 1
+
+    def decref(self, h: int) -> None:
+        """One fewer live reference to handle `h`.
+
+        At zero: `__del__` runs if the class defines one, every `weakref`
+        pointing here dies and fires its callback, and then -- CASCADING --
+        every reference THIS object itself held is dropped in turn. That
+        last step is not optional: it is what makes `a = [Foo()]; del a`
+        finalize `Foo()` in the same statement rather than only the list,
+        exactly as CPython's `tp_dealloc` recursing into its container does.
+        It is also, with NOTHING extra, why a genuine reference CYCLE does
+        NOT collapse this way: each member's count never reaches zero on
+        its own, because the other member is still holding one -- the same
+        limitation CPython's own refcounting has, which is why `gc.collect`
+        exists as a SEPARATE mechanism (`_apy_gc_collect`) rather than
+        something this function needs to know about.
+        """
+        if not h or h not in self._refcount:
+            return
+        self._refcount[h] -= 1
+        if self._refcount[h] > 0 or h in self._protected:
+            return
+        self._finalize_once(h)
+
+    def _finalize_once(self, h: int) -> None:
+        """Run `_finalize(h)`, but never twice for the same handle -- see
+        `_dead`. The shared tail of `decref` and `_unprotect`, the two
+        places a count landing at (or already past) zero decides to
+        finalize.
+        """
+        if h in self._dead:
+            return
+        self._dead.add(h)
+        self._finalizing.add(h)
+        try:
+            self._finalize(h)
+        finally:
+            self._finalizing.discard(h)
+
+    def _protect(self, h: int) -> None:
+        """Pin `h` so a `decref` landing on zero while it is pinned does
+        not finalize it -- see `_protected`'s own comment. Nests: two
+        pins need two lifts, which is what lets `_invoke_obj` pin the
+        same handle its own re-entrant call might also pin (`self`
+        passed to a method that itself constructs and passes `self`
+        onward) without the inner lift exposing the outer's window.
+        """
+        if h and h in self._refcount:
+            self._protected[h] = self._protected.get(h, 0) + 1
+
+    def _unprotect(self, h: int) -> None:
+        """Lift one pin from `_protect`. THE ZERO-CHECK IS REPLAYED HERE,
+        not skipped: a pinned handle can still be decrefed to zero while
+        pinned (that's the whole point), so once the last pin lifts,
+        whatever the true count settled at has to be re-examined -- a
+        pin that was never decremented past zero is a no-op read of a
+        positive count, and one that was is finalized now, exactly where
+        `decref` would have if it had not been pinned.
+        """
+        if not h or h not in self._protected:
+            return
+        n = self._protected[h] - 1
+        if n > 0:
+            self._protected[h] = n
+            return
+        del self._protected[h]
+        if self._refcount.get(h, 1) > 0:
+            return
+        self._finalize_once(h)
+
+    def settle(self, h: int) -> None:
+        """`h` just found a real, counted home -- `interpreter.py`'s
+        `put()` calls this right after its own `incref(h)`, when storing
+        `h` into a register. Whatever transient pin `_instantiate` (or
+        anywhere else) left on it while it was in flight, with nothing
+        BUT that pin standing between it and a premature `decref` in a
+        nested call, is no longer doing any work: the register itself is
+        a real reference now. Dropping the pin here rather than leaving
+        it for `_unprotect` to unwind matters when the pinning frame is
+        still several nested calls away from returning -- `_instantiate`
+        never unpins its own `obj` at all, precisely so this is the one
+        place that does. A no-op for a handle nothing ever pinned.
+        """
+        self._protected.pop(h, None)
+
+    def refcount(self, h: int) -> int:
+        """The shadow count `sys.getrefcount` reads, or `-1` for a handle
+        this scheme does not track (a plain scalar) -- the caller decides
+        what an untracked object's refcount should read as."""
+        return self._refcount.get(h, -1)
+
+    def _finalize(self, h: int) -> None:
+        obj = self._cells[h]
+        if isinstance(obj, Instance):
+            m = obj.cls.find("__del__")
+            if m is not None and isinstance(m, (Func, Native)):
+                saved_err, saved_val = self.err, self.err_value
+                self.err = None
+                self.err_value = None
+                try:
+                    self._invoke_obj(m.bind(obj), [])
+                except _Trap:
+                    raise
+                # A `__del__` THAT FAILS IS REPORTED AND SWALLOWED, exactly
+                # as CPython's does (`Exception ignored in: <bound method
+                # ...__del__...>`) -- to stderr, never stdout, so it never
+                # touches the byte-for-byte comparison the differential
+                # suite runs; and swallowed because the finalizer runs at a
+                # moment of this object's choosing, not the caller's, and a
+                # caller decref-ing something unrelated must not inherit a
+                # `__del__`'s own bug as its own failure.
+                if self.err is not None:
+                    kind, msg = self.err
+                    print(f"Exception ignored in: {obj!r}.__del__\n"
+                         f"{kind}: {msg}", file=sys.stderr)
+                self.err, self.err_value = saved_err, saved_val
+        for callback in self._weakrefs.pop(h, ()):
+            if callback is not None:
+                saved_err, saved_val = self.err, self.err_value
+                self.err = None
+                self.err_value = None
+                try:
+                    self._invoke_obj(callback, [])
+                except _Trap:
+                    raise
+                if self.err is not None:
+                    kind, msg = self.err
+                    print(f"Exception ignored in weakref callback\n"
+                         f"{kind}: {msg}", file=sys.stderr)
+                self.err, self.err_value = saved_err, saved_val
+        self._decref_contents(obj)
+
+    def _referent(self, obj) -> int | None:
+        """The handle for `obj`, if `_new` ever minted one for it -- the
+        lookup every heap-mutation incref/decref site uses, since a
+        container holds the dereferenced Python VALUE and not the handle
+        (see `_apy_seq_push` etc.): `id(obj)` recovers it through the same
+        `_identity` table `_new` populates. `None` for anything untracked.
+        """
+        return self._identity.get(id(obj))
+
+    def _decref_contents(self, obj) -> None:
+        """The cascade: dropping the last reference to a container drops
+        one reference to everything it was holding, exactly as CPython's
+        `tp_dealloc` walks a `list`/`dict`/instance `__dict__` on the way
+        down. Conservative by kind -- anything not listed here is a kind
+        this scheme does not track the CONTENTS of yet (see
+        `docs/STDLIB.md`'s coverage note for this feature), and is left
+        alone rather than guessed at: under-decrefing leaks a shadow count
+        forever (this object simply never reaches zero through this path),
+        which is the safe direction to be wrong in -- over-decrefing would
+        finalize something still alive.
+        """
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            for item in obj:
+                h = self._referent(item)
+                if h is not None:
+                    self.decref(h)
+                elif isinstance(item, (tuple, frozenset)):
+                    # A TUPLE/FROZENSET HAS NO HANDLE OF ITS OWN to
+                    # decref (see `_INTERNED`'s own comment -- neither
+                    # is interned), so `_referent` never finds one here
+                    # even though it may still be holding something that
+                    # DOES: `xs = [(Foo(),)]` finalizing nothing when
+                    # `xs` dies. Walked directly rather than through
+                    # `decref`, since there is no handle to call it on.
+                    self._decref_contents(item)
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                hk, hv = self._referent(k), self._referent(v)
+                if hk is not None:
+                    self.decref(hk)
+                elif isinstance(k, (tuple, frozenset)):
+                    self._decref_contents(k)
+                if hv is not None:
+                    self.decref(hv)
+                elif isinstance(v, (tuple, frozenset)):
+                    self._decref_contents(v)
+        elif isinstance(obj, Instance):
+            for v in obj.dict.values():
+                h = self._referent(v)
+                if h is not None:
+                    self.decref(h)
+            if obj.held is not None:
+                self._decref_contents(obj.held)
 
     def _get(self, h, where: str):
         h = int(h)
@@ -899,6 +1149,21 @@ class ObjectHost:
                     return obj
             else:
                 obj = Instance(f, self)
+            # PINNED FROM HERE TO WHEN THIS FUNCTION'S RETURN VALUE FINDS
+            # A REAL HOME. `obj` may not have a handle yet, and is about
+            # to be passed into `__init__` (below) where, absent a pin,
+            # its ONLY tracked reference for that call's whole length
+            # would be the `self` parameter binding `_call` itself
+            # creates and then drops at frame teardown -- landing on
+            # zero and finalizing the object under construction before
+            # `_instantiate` has even returned it to whoever asked for
+            # `C(...)`. Deliberately NOT unpinned before this function
+            # returns: the pin travels with the handle up through
+            # `_invoke`/`_apy_call` and is lifted by `ObjectHost.settle`,
+            # which `interpreter.py`'s `put()` calls once the value is
+            # actually stored into a register -- a real, counted owner.
+            h = self._value(obj)
+            self._protect(h)
             init = f.find("__init__")
             if isinstance(init, (Func, Native)):
                 self._invoke_obj(init.bind(obj), args, kwrest, bound)
@@ -1025,7 +1290,32 @@ class ObjectHost:
             raise _UserFailed
         fn = self._interp.module.functions[f.code & ~_FUNC_TAG]
         env = self._new(f)
-        result = self._interp._call(fn, [env] + [self._value(s) for s in slots])
+        values = [self._value(s) for s in slots]
+        # PINNED FOR THE CALL. `env` and every argument handle here may
+        # exist ONLY as this host frame's own local right now -- nothing
+        # has stored them into a register yet, which is the only place
+        # this scheme's `put()` choke point would count a reference. The
+        # clearest case is `self` for a constructor: `_instantiate` mints
+        # its handle and reaches `_invoke_obj` in the very same
+        # expression, so the object's ONLY tracked reference for the
+        # length of `__init__` is the parameter binding `_call` itself
+        # creates below -- which its own frame teardown correctly drops
+        # back out when `__init__` returns. Without a pin that drop lands
+        # on zero and finalizes the object being constructed, before
+        # `_instantiate` has even returned it to whoever asked for a new
+        # `Foo()`. Pinning costs nothing when a caller-side reference
+        # already exists (the pin just outlives a decref that would not
+        # have reached zero anyway) and is exactly what closes the gap
+        # when one does not yet.
+        self._protect(env)
+        for v in values:
+            self._protect(v)
+        try:
+            result = self._interp._call(fn, [env] + values)
+        finally:
+            self._unprotect(env)
+            for v in values:
+                self._unprotect(v)
         if self.err is not None:
             # The callee failed. Its report is already the first one, so there
             # is nothing to add -- only to stop, so that a NULL result never
@@ -2400,12 +2690,22 @@ def _apy_seq_push(h, a):
     item = h._get(a[1], "apy_seq_push")
     if isinstance(seq, tuple):
         h._cells[int(a[0])] = seq + (item,)
+        h.incref(int(a[1]))
         return h._none
     if not isinstance(seq, list):
         return h._fail(
             "AttributeError",
             f"'{h.kind_name(seq)}' object has no attribute 'append'")
     seq.append(item)
+    # THE LIST NOW HOLDS A REFERENCE TOO, not only whatever register or
+    # slot handed `item` here -- `xs = [Foo()]` finalizing `Foo()` the
+    # moment the CALL result's own temp register was consumed (see
+    # `_consume` in `interpreter.py`), before `xs.append` ever ran, is
+    # exactly the bug this closes. `a[1]` is the ORIGINAL handle, still
+    # the right one to count against even though `item` above is the
+    # dereferenced value `_decref_contents` will later look back up via
+    # `_referent`.
+    h.incref(int(a[1]))
     return h._none
 
 
@@ -2595,7 +2895,17 @@ def _apy_setitem(h, a):
         i += len(seq)
     if not 0 <= i < len(seq):
         return h._fail("IndexError", "list assignment index out of range")
+    # NEW BEFORE OLD, same reason as everywhere else this pattern
+    # appears: `xs[i] = xs[i]` has the same handle on both sides, and
+    # decrefing the slot's old occupant before the new one has its own
+    # reference would pass through zero for something not actually
+    # going away.
+    old = seq[i]
+    h.incref(int(a[2]))
     seq[i] = item
+    old_h = h._referent(old)
+    if old_h is not None:
+        h.decref(old_h)
     return h._none
 
 
@@ -2642,11 +2952,45 @@ def _dict_set(h, d, key, val):
     if bad:
         return h._fail("TypeError", f"cannot use '{bad}' as a dict key "
                                     f"(unhashable type: '{bad}')")
+    had_key = key in d
+    old = d.get(key) if had_key else None
     try:
         d[key] = val
     except TypeError as e:
         return h._fail_like(e)
+    # THE DICT NOW HOLDS ITS OWN REFERENCE to `val` (and to `key`, the
+    # first time this key is used) -- `h._value` recovers the SAME
+    # handle `_referent`/`decref` would later look it up as, whether it
+    # already existed (an object stored elsewhere too) or is minted here
+    # for the first time. NEW BEFORE OLD, same reason as `put()`'s own
+    # comment: `d[k] = d[k]` has the same handle on both sides.
+    h.incref(h._value(val))
+    if not had_key:
+        h.incref(h._value(key))
+    if had_key:
+        old_h = h._referent(old)
+        if old_h is not None:
+            h.decref(old_h)
     return h._none
+
+
+def _attr_store(h, d: dict, name: str, value) -> None:
+    """`d[name] = value` for an object's own attribute dict
+    (`Instance.dict`/`Exc.dict`/`Class.dict`/`Func.dict`), with the same
+    incref-new/decref-old bookkeeping `_dict_set` does for a Python
+    dict -- an attribute holds a reference exactly as a dict value does.
+    `name` is never incref'd: it is always a plain `str`, and a `str`
+    handle is never tracked (see `_INTERNED`) -- there is nothing there
+    for `incref` to do.
+    """
+    had = name in d
+    old = d.get(name) if had else None
+    d[name] = value
+    h.incref(h._value(value))
+    if had:
+        old_h = h._referent(old)
+        if old_h is not None:
+            h.decref(old_h)
 
 
 def _apy_clear(h, a):
@@ -2655,6 +2999,10 @@ def _apy_clear(h, a):
     if not isinstance(v, (list, dict, set)):
         return h._fail("AttributeError",
                        f"'{h.kind_name(v)}' object has no attribute 'clear'")
+    # EVERY REFERENCE `v` HELD IS DROPPED, same walk `_decref_contents`
+    # already does for a container reaching zero itself -- `.clear()` is
+    # exactly that, just without `v` itself going away too.
+    h._decref_contents(v)
     v.clear()
     return h._none
 
@@ -6539,11 +6887,11 @@ def _apy_default_setattr(h, a):
                 return 0
             if handled == 1:
                 return h._none
-        obj.dict[name] = value
+        _attr_store(h, obj.dict, name, value)
         return h._none
     if isinstance(obj, Exc):
         # `self.code = code` in a user exception's `__init__`.
-        obj.dict[name] = value
+        _attr_store(h, obj.dict, name, value)
         return h._none
     if isinstance(obj, Class):
         # `C.__name__ = ...` CHANGES WHAT THE CLASS IS CALLED. The name is a
@@ -6555,7 +6903,7 @@ def _apy_default_setattr(h, a):
             obj.name = str(value)
             _rename_exception(h, was, obj.name, obj)
             return h._none
-        obj.dict[name] = value
+        _attr_store(h, obj.dict, name, value)
         return h._none
     if isinstance(obj, Func):
         # A function carries whatever a program hangs on it, as it does in the
@@ -6563,7 +6911,7 @@ def _apy_default_setattr(h, a):
         # dict is made on first write so an ordinary `def` costs nothing.
         if obj.dict is None:
             obj.dict = {}
-        obj.dict[name] = value
+        _attr_store(h, obj.dict, name, value)
         return h._none
     return h._no_attr(obj, name)
 
@@ -7230,7 +7578,14 @@ def _apy_default_delattr(h, a):
         return h._fail("AttributeError",
                        f"'{h.kind_name(obj)}' object has no attribute "
                        f"'{name}'")
+    old = obj.dict[name]
     del obj.dict[name]
+    # THE INSTANCE'S OWN REFERENCE IS GONE -- the counterpart to
+    # `_attr_store`'s incref: `del self.x` drops the one `self.x = ...`
+    # added, exactly as `del a` drops a register's.
+    old_h = h._referent(old)
+    if old_h is not None:
+        h.decref(old_h)
     return h._none
 
 
@@ -8316,7 +8671,10 @@ def _apy_set_push(h, a):
     except TypeError as exc:
         return h._fail_like(exc)
     if isinstance(s, set):
+        was_new = item not in s
         s.add(item)
+        if was_new:
+            h.incref(int(a[1]))
         return h._none
     return h._fail("AttributeError",
                    f"'{h.kind_name(s)}' object has no attribute 'add'")
@@ -8327,7 +8685,13 @@ def _apy_set_discard(h, a):
     if not isinstance(s, set):
         return h._fail("AttributeError",
                        f"'{h.kind_name(s)}' object has no attribute 'discard'")
-    s.discard(h._get(a[1], "apy_set_discard"))
+    item = h._get(a[1], "apy_set_discard")
+    was_present = item in s
+    s.discard(item)
+    if was_present:
+        removed_h = h._referent(item)
+        if removed_h is not None:
+            h.decref(removed_h)
     return h._none
 
 
@@ -8685,7 +9049,18 @@ def _apy_delitem(h, a):
             return h._fail_like(exc)
         if key not in seq:
             return h._fail("KeyError", h._text(key, True))
+        old_val = seq[key]
         del seq[key]
+        # THE VALUE'S reference, mirroring `_dict_set`'s incref -- not
+        # the KEY'S: `seq[key]` looked the entry up by EQUALITY, and the
+        # object actually stored as the key (what a real decref needs
+        # to target) need not be identical to `key` here, only equal to
+        # it. Left as a documented, safe-direction gap -- see
+        # `_decref_contents`'s own for the matching one on the read
+        # side.
+        old_h = h._referent(old_val)
+        if old_h is not None:
+            h.decref(old_h)
         return h._none
     if not isinstance(seq, list):
         return h._fail("TypeError",
@@ -8697,14 +9072,23 @@ def _apy_delitem(h, a):
         if key.step not in (None, 1):
             return h._fail("ValueError",
                            "only step 1 slice deletion is supported")
+        removed = seq[key]
         del seq[key]
+        for item in removed:
+            item_h = h._referent(item)
+            if item_h is not None:
+                h.decref(item_h)
         return h._none
     i = int(key)
     if i < 0:
         i += len(seq)
     if not 0 <= i < len(seq):
         return h._fail("IndexError", "list assignment index out of range")
+    removed = seq[i]
     del seq[i]
+    removed_h = h._referent(removed)
+    if removed_h is not None:
+        h.decref(removed_h)
     return h._none
 
 

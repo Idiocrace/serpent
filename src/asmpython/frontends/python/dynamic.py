@@ -4804,16 +4804,50 @@ class DynamicLowering:
 
         A module-level name goes back to the zero its cell started at, so a
         later read is the NameError CPython raises rather than a stale value.
-        A LOCAL has no such state -- its register is just a register -- but
-        analysis has already dropped it from the definitely-assigned set, so a
-        later read is a compile error, which is where CPython's
-        UnboundLocalError would have been. Nothing to emit for that case.
+        A LOCAL has no such VALUE-correctness need -- its register is just a
+        register, and analysis has already dropped it from the
+        definitely-assigned set, so a later read is a compile error, which
+        is where CPython's UnboundLocalError would have been.
+
+        A LOCAL'S OWN SLOT IS STILL CLEARED, though (register, or cell for
+        one a closure shares) -- not for a later READ, which cannot happen,
+        but for the reference it holds: `del x` is the moment a Python
+        program observes `x`'s object losing this owner, and a register
+        that keeps the handle sitting in it (unread, but still THERE) has
+        this interpreter's shadow refcounting -- `ir/interpreter.py` --
+        treat it as live until the enclosing frame tears down, which is
+        the function returning rather than this statement running. Clearing
+        it is exactly what `_dyn_store` does on every ordinary reassignment
+        (`Op.COPY`'s own `dst`-write decrefs whatever was there); `del` is
+        the same drop with no replacement value.
         """
         if self._is_module_name(name):
             addr = self.b.reg(T.PTR)
             self.b.emit(Instruction(Op.GLOBAL_ADDR, T.PTR, dst=addr,
                                     sym=self.global_symbol(name)))
             self.b.store(T.PTR, self.b.const(T.PTR, 0), addr)
+            return
+        if (self._shadow is not None and name in self._shadow) or (
+                self._gen is not None and name in self._gen[1]) or (
+                self._class_binds is not None
+                and name in self._class_binds[2]):
+            # Not a plain register/cell this function owns outright -- a
+            # comprehension shadow, a generator slot, or a class
+            # namespace entry. `del` reaching here is rare enough (and
+            # each of those storages its own separate lifetime story)
+            # that clearing it is left for later, the same accepted gap
+            # as the several other heap-mutation sites `_decref_contents`
+            # does not yet walk.
+            return
+        sym = self.info.locals.get(name)
+        if sym is None:
+            return
+        zero = self.b.const(T.PTR, 0)
+        if sym.storage in (CELL, FREE):
+            self.b.call(T.PTR, "apy_cell_set", [sym.register, zero])
+        else:
+            self.b.emit(Instruction(Op.COPY, T.PTR, dst=sym.register,
+                                    args=[zero]))
 
     def _dyn_store(self, name: str, value: int) -> None:
         if self._class_binds is not None and name in self._class_binds[2]:

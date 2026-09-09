@@ -56,6 +56,12 @@ class Frame:
     func: Function
     registers: dict[int, int | float] = field(default_factory=dict)
     frame_base: int = 0
+    #: Countdown of remaining STATIC reads for each `T.PTR` register in
+    #: this function, or `None` when the optimisation below is not in
+    #: effect for it (no object runtime, or the function contains a
+    #: loop -- see `Interpreter._analyze`). A fresh copy per call, since
+    #: it counts down over the course of ONE invocation.
+    remaining: dict[int, int] | None = None
 
 
 class Memory:
@@ -128,6 +134,9 @@ class Interpreter:
         #: The status `plat_exit` was called with, or None if it never was.
         #: A host uses this to end the way a compiled program would.
         self.exit_status: int | None = None
+        #: `id(Function)` -> `(has_loop, read_count)`, memoised by
+        #: `_analyze`. A function is analysed at most once per run.
+        self._fn_analysis: dict[int, tuple[bool, dict[int, int]]] = {}
         for g in module.globals:
             addr = self.mem.alloc(max(1, g.size))
             if g.data:
@@ -341,10 +350,30 @@ class Interpreter:
             # measured against, which is what the corpus is for.
             return self._host(fn.name, args)
         fr = Frame(fn, frame_base=self.mem.brk)
+        # NOT GATED ON `self.objects` -- purely static, and cheap, so it
+        # runs even for the OUTERMOST call, before the object runtime
+        # necessarily exists yet (`self.objects` is lazy: the first
+        # `apy_*` call creates it). Gating this on `self.objects is not
+        # None` here left the very first frame -- a script's whole
+        # top-level body, for the common case -- permanently without a
+        # `remaining` table, since that check ran before this frame's
+        # first `apy_*` call had a chance to create one. `_consume`
+        # guards the actual decref on `self.objects` itself, which by
+        # the time anything reaches it, is set.
+        has_loop, read_count = self._analyze(fn)
+        if not has_loop:
+            fr.remaining = dict(read_count)
         for reg, val in zip(fn.params, args):
             fr.registers[reg] = val
+            # A PARAMETER IS A NEW BINDING, same as `put()` treats any other
+            # register write -- the caller's own reference to `val`
+            # (whatever slot it came from) is untouched; this is the
+            # callee's OWN, additional one.
+            if self.objects is not None and fn.registers.get(reg) is T.PTR and val:
+                self.objects.incref(val)
         blk = fn.blocks[0]
         prev_brk = self.mem.brk
+        returned = None
         try:
             while True:
                 nxt = None
@@ -357,6 +386,7 @@ class Interpreter:
                         nxt = res
                         break
                     if isinstance(res, _Return):
+                        returned = res.value
                         return res.value
                 if nxt is None:
                     raise Trap(f"{fn.name}/{blk.label}: fell off the end")
@@ -366,6 +396,183 @@ class Interpreter:
                 blk = target
         finally:
             self.mem.brk = prev_brk     # frame allocas die with the frame
+            if self.objects is not None:
+                # EVERY REGISTER IN THIS FRAME IS GOING OUT OF SCOPE. Decref
+                # each one that held a handle -- EXCEPT ONE occurrence of
+                # whatever is being returned (`returned` stays `None`, and
+                # so matches nothing, on a trap/exception rather than a real
+                # return): that reference is being HANDED TO THE CALLER, not
+                # dropped, and the caller's own `put()` -- in whichever
+                # `_exec` called this -- will count its new ownership on
+                # receipt. Skipping the decref here rather than fixing this
+                # frame's copy up first and asking the caller not to
+                # re-count leaves a handle passed through several nested
+                # returns slightly OVER-counted -- finalized a step too
+                # LATE, never a step too EARLY -- which is the direction
+                # `ObjectHost.decref`'s own docstring says is safe to be
+                # wrong in.
+                skipped = False
+                for reg, ty in fr.func.registers.items():
+                    if ty is not T.PTR:
+                        continue
+                    val = fr.registers.get(reg)
+                    if not val:
+                        continue
+                    if not skipped and val == returned:
+                        skipped = True
+                        continue
+                    self.objects.decref(val)
+
+    def _analyze(self, fn: Function) -> tuple[bool, dict[int, int]]:
+        """Whether `fn` has a loop, and how many times each `T.PTR`
+        register is READ (an operand of some instruction, anywhere in the
+        function) in total. Memoised per function -- purely static, so it
+        never changes across calls.
+
+        WHAT THIS BUYS: `Op.COPY` and `Op.STORE` -- `x = <expr>` and a
+        global/attribute assignment -- read a source register whose value
+        they hand to a longer-lived home, but that source register itself
+        keeps counting as an owner (`put()`'s own incref when it was
+        FIRST written) until something decrefs it. Nothing does, ordinarily,
+        until the register's whole FRAME tears down -- which for a
+        function is that call's return, and for a module's top-level code
+        is the end of the program. `_consume` uses `read_count` to tell
+        the LAST static read of a register from an earlier one, so that
+        last read can retire the register's own reference right there
+        instead of waiting for the frame to end.
+
+        LOOPS ARE EXCLUDED ENTIRELY, for one function-wide reason: a
+        register's STATIC read count is not its DYNAMIC one when a read
+        sits inside a loop body -- the same instruction fires every
+        iteration, and retiring the register's reference after the first
+        pass would finalize something a later pass still needs to read.
+        Detecting per-register whether a given read is actually inside a
+        loop (rather than merely "this function has one somewhere") would
+        recover the optimisation for the rest of a loopy function, but
+        that is real control-flow analysis; ruling out the whole function
+        is the cheap, safe version -- registers in it simply keep waiting
+        for frame teardown, exactly as they did before this existed.
+        """
+        cached = self._fn_analysis.get(id(fn))
+        if cached is not None:
+            return cached
+        has_loop = self._has_cycle(fn)
+        read_count: dict[int, int] = {}
+        for blk in fn.blocks:
+            for ins in blk.instructions:
+                for reg in ins.args:
+                    if fn.registers.get(reg) is T.PTR:
+                        read_count[reg] = read_count.get(reg, 0) + 1
+        result = (has_loop, read_count)
+        self._fn_analysis[id(fn)] = result
+        return result
+
+    def _has_cycle(self, fn: Function) -> bool:
+        """Does `fn`'s control-flow graph have an actual cycle -- some
+        block reachable from itself along a real path -- reachable from
+        `fn`'s entry block?
+
+        NOT "does some edge point to an earlier block": this compiler's
+        own bound/unbound-variable check (every read of a name that
+        might be unassigned) emits an `UNBOUND` block that raises, calls
+        `apy_fatal_if_error` (which never returns once an error is
+        pending), and only THEN has an unconditional `jump` back to the
+        `BOUND` block it belongs to -- a well-formed IR needs a
+        terminator there even though control never reaches it. That jump
+        points backward in block order on virtually every function that
+        reads a possibly-unbound name, which is nearly all of them, and
+        a plain "target index <= source index" check flagged it as a
+        loop every time, disabling `_analyze`'s optimisation almost
+        everywhere it mattered, including a plain top-level script.
+        `BOUND` never leads back to that specific `UNBOUND` block, so it
+        is not actually part of a cycle -- there is no path from `BOUND`
+        back to it -- which is exactly what a real cycle test answers
+        and a same-or-earlier-index test does not.
+
+        Standard DFS back-edge test: a GRAY node is one on the current
+        path (an ancestor, not yet fully explored); an edge to a GRAY
+        node is a genuine back edge, and a graph has a cycle reachable
+        from the start iff DFS from it finds one. Iterative, to not
+        depend on Python's recursion limit for a function with an
+        unusually large block count.
+        """
+        blocks = {b.label: b for b in fn.blocks}
+        if not fn.blocks:
+            return False
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {label: WHITE for label in blocks}
+        start = fn.blocks[0].label
+        # Each stack entry is (label, index of the next successor to try)
+        # -- the standard "explicit stack" shape for an iterative DFS
+        # that needs to resume a node after each child returns, the
+        # same thing the call stack would do for a recursive version.
+        succs_of: dict[str, list[str]] = {}
+        stack: list[tuple[str, int]] = [(start, 0)]
+        color[start] = GRAY
+        while stack:
+            label, idx = stack[-1]
+            succs = succs_of.get(label)
+            if succs is None:
+                blk = blocks.get(label)
+                succs = succs_of[label] = blk.successors if blk is not None else []
+            advanced = False
+            while idx < len(succs):
+                nxt = succs[idx]
+                idx += 1
+                c = color.get(nxt, BLACK)   # an unknown label: nothing to visit
+                if c == GRAY:
+                    return True
+                if c == WHITE:
+                    color[nxt] = GRAY
+                    stack[-1] = (label, idx)
+                    stack.append((nxt, 0))
+                    advanced = True
+                    break
+            if advanced:
+                continue
+            stack[-1] = (label, idx)
+            color[label] = BLACK
+            stack.pop()
+        return False
+
+    def _consume(self, fr: Frame, reg: int) -> None:
+        """One static read of `reg` -- from `_analyze`'s count -- has just
+        been spent. At the last one, this invocation's value for `reg`
+        will never be read again (true only because `_analyze` found no
+        loop in this function, so the static count IS the dynamic one),
+        so the register's own reference is dropped here.
+
+        CALLED AFTER the consuming instruction's OWN `put()`/incref of
+        the same handle has already run: `x = t` and `t` are the SAME
+        handle at that point, and dropping `t`'s reference FIRST would
+        read as zero and finalize an object one line away from gaining
+        the new owner `put()` just gave it.
+        """
+        if fr.remaining is None or self.objects is None:
+            # NO OBJECT RUNTIME: a `T.PTR` register in a program that
+            # never touches `apy_*` at all is a raw address (see `put()`'s
+            # own "one pointer type for both" comment) -- `_analyze` does
+            # not know that when it builds `read_count`, since it has no
+            # way to tell a handle-shaped program from an address-shaped
+            # one ahead of time. Nothing to consume in that case.
+            return
+        left = fr.remaining.get(reg)
+        if left is None:
+            return
+        left -= 1
+        fr.remaining[reg] = left
+        if left <= 0:
+            v = fr.registers.get(reg)
+            if v:
+                self.objects.decref(v)
+                # CLEARED, not merely counted down: `_call`'s frame
+                # teardown decrefs every `T.PTR` register still holding a
+                # value, with no idea a register's reference was already
+                # retired here -- left as `v`, it would be decref'd a
+                # SECOND time at teardown, one too many, finalizing an
+                # object that is (from this frame's point of view) still
+                # alive through whatever `reg` was copied/stored into.
+                fr.registers[reg] = 0
 
     def _exec(self, fr: Frame, ins: Instruction):
         op, ty = ins.op, ins.ty
@@ -382,13 +589,73 @@ class Interpreter:
 
         def put(v):
             if ins.dst is not None:
+                # SHADOW REFCOUNTING'S ONE CHOKE POINT for every register in
+                # the interpreter: every instruction with a `dst` writes it
+                # through here, so hooking this one function -- rather than
+                # each of the several dozen opcode handlers above and below
+                # -- covers every local/temporary's lifecycle uniformly. See
+                # `ObjectHost.incref`/`decref` for what happens at each end.
+                #
+                # `fr.func.registers[dst]`, NOT `ty`: `ty` is documented
+                # (module.py) to be the OPERAND type for a comparison, not
+                # the result's -- `apy_x == apy_y` has `ty is T.PTR` but
+                # writes an `i1`, and treating that `0`/`1` as a handle
+                # would decref whatever handle happened to equal 0 or 1.
+                # The register's OWN declared type has no such ambiguity:
+                # it is fixed for the register's whole life (module.py).
+                #
+                # KNOWN, ACCEPTED IMPRECISION: a `ptr` register can ALSO
+                # hold a raw memory address (an `alloca`, a global's
+                # address) rather than an object-runtime handle -- the IR
+                # has one pointer type for both, and nothing here tells them
+                # apart. `ObjectHost.incref`/`decref` are no-ops for a
+                # number that is not a handle THIS RUN has minted, so this
+                # is silent almost always; the one way it can go wrong is a
+                # raw address numerically coinciding with a handle that
+                # genuinely exists right now, which only a program mixing
+                # heavy `alloca` use with the object runtime in the same
+                # function risks. Every bundled stdlib module -- the
+                # differential suite this exists to serve -- is ordinary
+                # dynamic Python and never allocas, so this does not reach
+                # them.
+                if self.objects is not None and fr.func.registers.get(ins.dst) is T.PTR:
+                    old = R.get(ins.dst)
+                    # NEW BEFORE OLD. `x = x` -- or anything that hands
+                    # this register back its own current value, a tuple
+                    # swap's `a[i], a[j] = a[j], a[i]` included -- has
+                    # `v == old`: decrefing first would pass through a
+                    # transient zero and finalize an object that is, by
+                    # the end of this one assignment, exactly as alive as
+                    # it was at the start.
+                    if v:
+                        self.objects.incref(v)
+                        # LIFTS ANY `_instantiate`-STYLE PIN now that the
+                        # register itself is a real reference -- see
+                        # `ObjectHost.settle`. A freshly constructed
+                        # object's handle rides pinned, not decref'd,
+                        # all the way from `_instantiate` up through
+                        # every host frame in between (none of which
+                        # this interpreter's refcounting hooks touch)
+                        # to exactly this store; settling anywhere else
+                        # would either release too early (a nested call
+                        # still in flight) or never (nothing else calls
+                        # it).
+                        self.objects.settle(v)
+                    if old:
+                        self.objects.decref(old)
                 R[ins.dst] = v
             return None
 
         if op is Op.CONST:
             return put(float(ins.imm) if ty.is_float else _wrap(int(ins.imm), ty))
         if op is Op.COPY:
-            return put(a(0))
+            src = ins.args[0]
+            res = put(a(0))
+            # See `_consume`: retires the SOURCE register's own reference
+            # once this was its last static read, now that `put()` above
+            # has already given the destination its own.
+            self._consume(fr, src)
+            return res
         if op is Op.GLOBAL_ADDR:
             return put(self.globals[ins.sym])
         if op is Op.FUNC_ADDR:
@@ -425,7 +692,47 @@ class Interpreter:
         if op is Op.LOAD:
             return put(self.mem.read(int(a(0)), ty))
         if op is Op.STORE:
-            self.mem.write(int(a(1)), ty, a(0))
+            addr = int(a(1))
+            # THE SAME CHOKE POINT AS `put()`, for a `ptr`-typed value
+            # landing in MEMORY rather than a register -- a global (`b =
+            # Foo(...)` at module scope lowers to `global_addr`+`store`,
+            # never through a register `dst`) or an address-taken local.
+            # Without this a global holding the only reference to an
+            # object never triggers `decref` on reassignment or `del`,
+            # so nothing here ever finalizes at the moment a Python
+            # program would observe it -- only ever (if at all) whenever
+            # something else happens to touch the same handle.
+            #
+            # `ty`, NOT A DECLARED SLOT TYPE: unlike a register, a raw
+            # memory address has no type of its own in this IR (`Global`
+            # carries only a byte size -- see `module.py`) -- but unlike
+            # `put()`'s `ins.dst` case, `Op.STORE`'s `ty` IS unambiguously
+            # the type of the value being stored (`self.mem.write` above
+            # already trusts it for that), so there is no equivalent of
+            # the comparison-operand ambiguity `put()` has to route
+            # around. The same accepted imprecision applies as there: a
+            # `ptr` store can be a raw address rather than a handle, and
+            # nothing here tells them apart -- see `put()`'s own comment.
+            if self.objects is not None and ty is T.PTR:
+                old = self.mem.read(addr, ty)
+                v = a(0)
+                self.mem.write(addr, ty, v)
+                # NEW BEFORE OLD -- see `put()`'s own comment: `old == v`
+                # (storing a global's own current value back into it) must
+                # not decref through a transient zero before the matching
+                # incref lands.
+                if v:
+                    self.objects.incref(int(v))
+                    self.objects.settle(int(v))
+                if old:
+                    self.objects.decref(int(old))
+                # See `_consume`: the SOURCE register (`ins.args[0]`) held
+                # its own reference from whenever it was written; now that
+                # the address just got its own (above), retire the
+                # register's if this was its last static read.
+                self._consume(fr, ins.args[0])
+                return None
+            self.mem.write(addr, ty, a(0))
             return None
         if op is Op.OFFSET:
             return put(int(a(0)) + int(a(1)))
@@ -434,11 +741,27 @@ class Interpreter:
             callee = self.module.function(ins.sym)
             if callee is None:
                 raise Trap(f"call to unknown function {ins.sym!r}")
-            return put(self._call(callee, [R[x] for x in ins.args]))
+            res = put(self._call(callee, [R[x] for x in ins.args]))
+            # See `_consume`: an argument register that is never read
+            # again after this call -- `apy_seq_push(lst, Foo(...))`'s
+            # freshly built `Foo(...)`, most of all -- otherwise sits
+            # incref'd by nothing but its OWN temp register until this
+            # frame tears down, which is exactly `put()`'s own COPY/STORE
+            # story but for "handed to a call" instead of "handed to a
+            # variable". AFTER `put()`, same reason as there: `self._call`
+            # may have returned the very handle one of these arguments
+            # held (an identity-shaped builtin), and `put()`'s own incref
+            # of the result has to land first.
+            for reg in ins.args:
+                self._consume(fr, reg)
+            return res
         if op is Op.CALL_PTR:
             idx = int(a(0)) & ~_FUNC_TAG
-            return put(self._call(self.module.functions[idx],
-                                  [R[x] for x in ins.args[1:]]))
+            res = put(self._call(self.module.functions[idx],
+                                 [R[x] for x in ins.args[1:]]))
+            for reg in ins.args:
+                self._consume(fr, reg)
+            return res
 
         if op is Op.JUMP:
             return _Jump(ins.labels[0])
