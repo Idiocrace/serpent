@@ -5029,6 +5029,17 @@ class Instance:
     def __bool__(self):
         out = self._send("__bool__")
         if out is NotImplemented:
+            # A CLASS THAT EXTENDS A BUILTIN has one for everything it did
+            # not write -- `_apy_len` already asks `held` before walking the
+            # dunder for exactly this reason, and this had not: `class
+            # Counter(dict)` with no `__len__` of its own fell straight to
+            # "no `__bool__` and no `__len__`", so `bool(Counter())` was
+            # ALWAYS True and `not Counter()` was ALWAYS False, regardless
+            # of content. `multimode('')` (an empty `Counter`) read its
+            # `if not counts: return []` as unreachable and called
+            # `max(counts.values())` on nothing.
+            if self.cls.find("__len__") is None and self.held is not None:
+                return bool(self.held)
             out = self._send("__len__")
             # No `__bool__` and no `__len__` is ALWAYS TRUE. Answering False
             # would silently invert every bare `if obj:`.

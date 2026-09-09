@@ -268,6 +268,15 @@ APY_API int64_t apy_truth(apy_value v) {
         apy_value r = apy_unary_dunder(v, "__bool__");
         if (r) return apy_truth(r);
         if (apy_error_occurred()) return 0;
+        /* A CLASS THAT EXTENDS A BUILTIN has one for everything it did not
+           write -- `apy_len` below already asks `held` before walking the
+           dunder for exactly this reason, and this had not: `class
+           Counter(dict)` with no `__len__` of its own fell straight through
+           to "no `__bool__` and no `__len__`", so `bool(Counter())` was
+           ALWAYS True regardless of content. */
+        if (apy_inst_held(v)
+                && !apy_class_find(O(v)->v.o.cls, apy_name("__len__")))
+            return apy_truth(apy_inst_held(v));
         r = apy_unary_dunder(v, "__len__");
         if (r) return apy_truth(r);
         return 1;
