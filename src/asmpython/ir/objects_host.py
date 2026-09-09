@@ -2506,10 +2506,20 @@ def _apy_getitem(h, a):
             # out of range" for one.
             return h._fail("IndexError", "list index out of range")
         return h._value(seq[i])
-    if isinstance(seq, bytes):
+    if isinstance(seq, (bytes, bytearray)):
         # An INT, not a one-byte bytes. Slicing gives bytes back and indexing
         # does not, which is the one asymmetry a reader will not expect and
         # the C reproduces in `apy_bytes_getitem`.
+        #
+        # BYTEARRAY TOO: the C represents bytes and bytearray as one kind
+        # with a mutable flag (`APY_BYTES_K`), so `apy_bytes_getitem` never
+        # distinguished them and `ba[i]` has always returned an int there.
+        # This `isinstance(seq, bytes)` check did distinguish them -- Python's
+        # own `bytearray` is not a `bytes` subclass -- so `ba[i]` fell through
+        # every case below and reported "'bytearray' object is not
+        # subscriptable" for a value the C backend indexes correctly. Found
+        # writing `struct.unpack_from`, which reads a buffer byte by byte and
+        # is the ordinary way a bytearray is read at all.
         if i < 0:
             i += len(seq)
         if not 0 <= i < len(seq):
