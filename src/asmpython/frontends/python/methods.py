@@ -157,6 +157,12 @@ DYN_METHOD_TABLE = {
     "__len__":      ["apy_len"],
     "__repr__":     ["apy_repr"],
     "__str__":      ["apy_str"],
+    # `(5).__index__()` -- PEP 357, and what `operator.index` reaches
+    # directly. See `apy_index_obj` (`objects/c/_builtins.py`): the boxed
+    # twin of `apy_index`, which unpacks a machine word for a subscript
+    # instead. Found writing `operator.index`, which the pure-Python spec
+    # in `Lib/operator.py` calls exactly this way.
+    "__index__":    ["apy_index_obj"],
     "add_note":     [None, "apy_add_note"],
     # PEP 654. `subgroup` answers one group or None; `split` is shared with
     # `str.split` and dispatches on the receiver -- see `apy_split_of`.

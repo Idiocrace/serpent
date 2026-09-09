@@ -1144,6 +1144,28 @@ APY_API apy_value apy_abs(apy_value v) {
                      apy_kind_name(v), "");
 }
 
+/* `v.__index__()` called directly -- what `operator.index` and PEP 357's
+   other two consumers (`hex`/`oct`/`bin`, a subscript) reach through
+   already, but as the BOXED Python object those name rather than the
+   machine word `apy_index` (mathints.py) unpacks for a subscript.
+
+   Mirrors `apy_to_int`'s numeric branch: a big answers ITSELF -- it is
+   already exactly the integer it names -- and a bool answers a genuine
+   `int`, not itself, because `True.__index__()` is `1` and `type(1)` is not
+   `bool`; `apy_is_int_like` covers both and `apy_from_int` does the
+   normalising for the ones big skips. */
+APY_API apy_value apy_index_obj(apy_value v) {
+    if (O(v)->kind == APY_INST_K) {
+        apy_value r = apy_unary_dunder(v, "__index__");
+        if (r || apy_error_occurred()) return r;
+    }
+    if (apy_is_big(v)) return v;
+    if (apy_is_int_like(v)) return apy_from_int(O(v)->v.i);
+    return apy_fail2("TypeError",
+                     "'%s' object cannot be interpreted as an integer%s",
+                     apy_kind_name(v), "");
+}
+
 /* `round` is round-HALF-TO-EVEN, which C's `round` is not: C rounds half away
    from zero, so it answers 3 for round(2.5) where Python answers 2. And
    `round(x)` with no digits returns an INT. */
