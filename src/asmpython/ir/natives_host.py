@@ -186,6 +186,54 @@ def _remove_directory(interp, args):
     return 1
 
 
+def _posix_unlink(interp, args):
+    """POSIX `unlink`/`remove`: 0 on success, -1 on failure."""
+    try:
+        os.remove(_cstr(interp, int(args[0])))
+    except OSError:
+        return -1
+    return 0
+
+
+def _posix_rmdir(interp, args):
+    """POSIX `rmdir`: 0 on success, -1 on failure."""
+    try:
+        os.rmdir(_cstr(interp, int(args[0])))
+    except OSError:
+        return -1
+    return 0
+
+
+def _getcwd(interp, args):
+    """POSIX `getcwd(buf, size)`, and NULL for `buf` is the interesting
+    case: glibc allocates in that mode, so the answer is a non-null
+    pointer the caller frees. THE ADDRESS IS NOT THE POINT and cannot be
+    -- this interpreter's pointers are offsets into its own `bytearray`
+    and it has no allocator to hand out here, so a NULL `buf` answers a
+    non-null SENTINEL. What a program can check about that call is that
+    it did not fail, which is what a test asking "is an int accepted
+    where a pointer is declared" is really asking; a program that then
+    DEREFERENCES the result is doing something this path never promised.
+
+    With a real buffer the answer is the buffer, filled -- that much is
+    exact.
+    """
+    addr, size = int(args[0]), int(args[1])
+    cwd = os.getcwd().encode("utf-8") + b"\0"
+    if addr == 0:
+        return _NONNULL_SENTINEL
+    if size < len(cwd):
+        return 0
+    _writeback(interp, addr, cwd)
+    return addr
+
+
+#: What `_getcwd` answers for an allocating call. Not an address anything
+#: may read: high enough that no `Memory` offset collides with it, and
+#: non-zero so a caller's success check is the truth.
+_NONNULL_SENTINEL = 1 << 40
+
+
 #: THE WHOLE SURFACE, and deliberately a short one. A symbol reaches this file
 #: only because a bundled module declared it, so the table grows when the
 #: standard library does and not before -- it is not an attempt to bind libc.
@@ -199,4 +247,29 @@ _TABLE = {
     "CreateDirectoryA": _create_directory,
     "DeleteFileA": _delete_file,
     "RemoveDirectoryA": _remove_directory,
+    # THE SAME CALLS UNDER THE NAMES POSIX SPELLS THEM. `_open` is MSVC's
+    # name for `open`, and a program declaring the POSIX one is asking for
+    # the same descriptor -- the handlers already go through Python's `os`,
+    # which does not care which spelling got here.
+    #
+    # WORTH BINDING EVEN THOUGH `bundled/pathlib.py` USES THE OTHER SET: a
+    # program written on Linux declares the Linux name, and the compiled
+    # path links it without being asked. The interpreter refusing it made
+    # the two paths disagree about a program the C backend builds and runs
+    # correctly, which is the one thing the differential arrangement exists
+    # to catch.
+    "open": _open,
+    "close": _close,
+    "read": _read,
+    "write": _write,
+    "lseek": _lseek,
+    # THE POSIX ONES ANSWER POSIX'S WAY. `DeleteFileA` returns non-zero on
+    # success and `unlink` returns 0, so aliasing the same handler under
+    # both names would answer the Windows convention to a program written
+    # against the POSIX one -- `libc.unlink(name) == 0` reading False for a
+    # file that was deleted. Different contract, different handler.
+    "unlink": _posix_unlink,
+    "remove": _posix_unlink,
+    "rmdir": _posix_rmdir,
+    "getcwd": _getcwd,
 }

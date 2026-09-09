@@ -52,6 +52,8 @@ asmpython toolchains                    # lists it
 | `cc` | hands everything to `gcc`/`clang`. Assembles `.s`, compiles `.c`, links, and finds the system libraries. The default. |
 | `jar` | packages class files into a runnable jar. Chosen automatically by the `jvm` target, which names it in `default_toolchain`. |
 | `baremetal` | a freestanding image: no libc, no start files, a linker script, and a runtime built from source. Chosen automatically when the target's `os` is `"none"`. |
+| `cpyext` | compiles and links a CPython extension module — a `.so` or a `.pyd` that `import` finds. Chosen automatically by the `cpyext` target. |
+| `pyc` | writes the `pybc` backend's `.pyc` where `-o` says, rather than under an artifact name in a directory. Chosen automatically by a target whose object format is `pyc`. |
 | `none` | writes the artifacts and stops. What `--emit` means. |
 
 `jar` needs no JDK. A jar is a zip with a manifest and Python has both, so

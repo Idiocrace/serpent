@@ -336,10 +336,30 @@ class TestTheJvmTarget:
     def test_it_produces_a_jar(self):
         assert JVM_TARGET.executable_suffix == ".jar"
 
-    def test_every_other_target_still_defaults_to_the_c_driver(self):
+    def test_a_target_naming_a_toolchain_names_one_that_can_link_it(self):
+        """The other half of the rule above, stated as the rule.
+
+        This was "every target other than `jvm` defaults to the C driver",
+        which was true when `jar` was the only exception and silently
+        wrong afterwards: `cpyext` and `pybc` each grew a toolchain of
+        their own, and a list of exceptions goes stale every time one is
+        added -- which is what it did, failing with `got 'pyc'` about a
+        target working exactly as intended.
+
+        WHAT ACTUALLY MATTERS is that a target either takes the default
+        (empty, meaning `cc`) or names a toolchain that is REGISTERED and
+        SAYS IT SUPPORTS THAT TARGET. A name that is neither is the bug
+        this guards -- a target that cannot be built at all, discovered
+        by a user rather than here.
+        """
+        from asmpython import link as link_registry
+        link_registry.load_builtin()
         for name, t in target_registry.available().items():
-            if name != "jvm":
-                assert t.default_toolchain == "", name
+            if not t.default_toolchain:
+                continue
+            chain = link_registry.get(t.default_toolchain)
+            assert chain is not None, (name, t.default_toolchain)
+            assert chain.supports(t), (name, t.default_toolchain)
 
 
 class TestReadingAClassPath:

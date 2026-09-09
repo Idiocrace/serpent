@@ -250,39 +250,76 @@ class TestPointerArguments:
     #: Opened, written, read back and removed, using only symbols that no
     #: header the runtime includes declares. `_write`/`_read` take a pointer,
     #: which is what makes this more than a `sqrt` test.
+    #:
+    #: PER PLATFORM, because the SYMBOL NAMES AND THE FLAG VALUES BOTH ARE.
+    #: `_open` is MSVC's spelling of `open` and `O_CREAT` is 256 there and 64
+    #: here, so one hard-coded program can only ever run on one of them --
+    #: and this file used to hold the Windows one, which meant three tests
+    #: that could not pass on the machine most people run the suite on. What
+    #: cannot vary is the set of names AVAILABLE: `mkdir` and `rmdir` are
+    #: declared by headers the C runtime includes and the backend's `extern`
+    #: conflicts with them, which is a fact about this compiler rather than
+    #: about the platform, so both columns stay inside `<fcntl.h>` and
+    #: `<unistd.h>` -- neither of which the runtime includes.
+    if sys.platform == "win32":
+        _LIB = "c"
+        _OPEN, _CLOSE, _READ, _WRITE = "_open", "_close", "_read", "_write"
+        #: `O_WRONLY | O_CREAT | O_TRUNC | O_BINARY`, MSVC's values.
+        _WRONLY_CREATE = 1 | 256 | 512 | 32768
+        _RDONLY = 0 | 32768
+        _MODE = 128
+    else:
+        _LIB = "c"
+        _OPEN, _CLOSE, _READ, _WRITE = "open", "close", "read", "write"
+        #: `O_WRONLY | O_CREAT | O_TRUNC` on Linux. There is no `O_BINARY`:
+        #: POSIX has one kind of file.
+        _WRONLY_CREATE = 1 | 64 | 512
+        _RDONLY = 0
+        _MODE = 420                       # 0o644
+
     ROUNDTRIP = """\
         import ctypes
-        libc = ctypes.CDLL("c")
-        libc._open.restype = ctypes.c_int
-        libc._open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
-        libc._close.restype = ctypes.c_int
-        libc._close.argtypes = [ctypes.c_int]
-        libc._read.restype = ctypes.c_int
-        libc._read.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-        libc._write.restype = ctypes.c_int
-        libc._write.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        libc = ctypes.CDLL("%(lib)s")
+        libc.%(open)s.restype = ctypes.c_int
+        libc.%(open)s.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        libc.%(close)s.restype = ctypes.c_int
+        libc.%(close)s.argtypes = [ctypes.c_int]
+        libc.%(read)s.restype = ctypes.c_int
+        libc.%(read)s.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        libc.%(write)s.restype = ctypes.c_int
+        libc.%(write)s.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
 
         name = "apy-ctypes-case.bin"
-        fd = libc._open(name, 1 | 256 | 512 | 32768, 128)
+        fd = libc.%(open)s(name, %(wrflags)d, %(mode)d)
         print("write fd ok:", fd >= 0)
-        print("wrote:", libc._write(fd, b"abc\\x00d", 5))
-        libc._close(fd)
+        print("wrote:", libc.%(write)s(fd, b"abc\\x00d", 5))
+        libc.%(close)s(fd)
 
-        fd = libc._open(name, 0 | 32768, 0)
+        fd = libc.%(open)s(name, %(rdflags)d, 0)
         buf = bytearray(5)
-        print("read:", libc._read(fd, buf, 5))
-        libc._close(fd)
+        print("read:", libc.%(read)s(fd, buf, 5))
+        libc.%(close)s(fd)
         print("got:", bytes(buf))
 
         # REMOVED BY THE PROGRAM, because it runs in the repository root and a
         # test that leaves a file behind makes `git status` dirty for whoever
-        # runs the suite next. `DeleteFileA` rather than `_unlink`: the second
-        # is declared in MinGW's <stdio.h> and the extern conflicts.
-        k32 = ctypes.CDLL("kernel32")
-        k32.DeleteFileA.restype = ctypes.c_int
-        k32.DeleteFileA.argtypes = [ctypes.c_char_p]
-        print("cleaned:", k32.DeleteFileA(name) != 0)
-    """
+        # runs the suite next. On Windows `DeleteFileA` rather than `_unlink`:
+        # the second is declared in MinGW's <stdio.h> and the extern conflicts.
+        %(cleanup)s
+    """ % {
+        "lib": _LIB, "open": _OPEN, "close": _CLOSE, "read": _READ,
+        "write": _WRITE, "wrflags": _WRONLY_CREATE, "rdflags": _RDONLY,
+        "mode": _MODE,
+        "cleanup": (
+            'k32 = ctypes.CDLL("kernel32")\n'
+            '        k32.DeleteFileA.restype = ctypes.c_int\n'
+            '        k32.DeleteFileA.argtypes = [ctypes.c_char_p]\n'
+            '        print("cleaned:", k32.DeleteFileA(name) != 0)'
+            if sys.platform == "win32" else
+            'libc.unlink.restype = ctypes.c_int\n'
+            '        libc.unlink.argtypes = [ctypes.c_char_p]\n'
+            '        print("cleaned:", libc.unlink(name) == 0)'),
+    }
 
     @harness.needs("gcc")
     def test_a_buffer_is_filled_by_the_callee_when_compiled(self, tmp_path):
@@ -318,7 +355,14 @@ class TestPointerArguments:
     #: pointer parameter and `CreateDirectoryA(path, 0)` is the ordinary way
     #: to write "no security descriptor"; refusing it made every native call
     #: with a NULL argument a TypeError.
-    NULL_ARGUMENT = """\
+    #:
+    #: PER PLATFORM for the same reason `ROUNDTRIP` is, and the POSIX column
+    #: uses `getcwd(NULL, 0)` -- glibc's documented "allocate one for me"
+    #: mode, and the most ordinary nullable pointer argument there is. The
+    #: obvious POSIX mirror of the Windows case, `mkdir(path, mode)`, cannot
+    #: be used: `<sys/stat.h>` declares it and the backend's `extern`
+    #: conflicts, exactly as MinGW's `<stdio.h>` does for `_unlink`.
+    NULL_ARGUMENT = ("""\
         import ctypes
         k32 = ctypes.CDLL("kernel32")
         k32.CreateDirectoryA.restype = ctypes.c_int
@@ -333,7 +377,26 @@ class TestPointerArguments:
         print("is dir:", (k32.GetFileAttributesA(name) & 16) != 0)
         print("removed:", k32.RemoveDirectoryA(name) != 0)
         print("gone:", k32.GetFileAttributesA(name) == 4294967295)
-    """
+    """ if sys.platform == "win32" else """\
+        import ctypes
+        libc = ctypes.CDLL("c")
+        libc.getcwd.restype = ctypes.c_void_p
+        libc.getcwd.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        libc.open.restype = ctypes.c_int
+        libc.open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        libc.close.restype = ctypes.c_int
+        libc.close.argtypes = [ctypes.c_int]
+        libc.unlink.restype = ctypes.c_int
+        libc.unlink.argtypes = [ctypes.c_char_p]
+
+        name = "apy-ctypes-case-null.bin"
+        print("made:", libc.getcwd(0, 0) != 0)
+        fd = libc.open(name, 1 | 64 | 512, 420)
+        print("is dir:", fd >= 0)
+        libc.close(fd)
+        print("removed:", libc.unlink(name) == 0)
+        print("gone:", libc.open(name, 0, 0) < 0)
+    """)
 
     @harness.needs("gcc")
     def test_an_int_where_a_pointer_is_declared_when_compiled(self, tmp_path):

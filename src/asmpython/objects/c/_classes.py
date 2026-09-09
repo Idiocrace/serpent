@@ -394,10 +394,14 @@ APY_API apy_value apy_type_alias(apy_value name, apy_value value,
 APY_API apy_value apy_import(apy_value name) {
     static const char *known[] = {
         "__future__", "_pyast", "_pycompile", "_pylex", "_pyparse",
-        "_pyrun", "_pyvalidate", "abc", "asyncio", "collections",
-        "collections.abc", "contextlib", "copy", "dataclasses", "enum",
-        "functools", "inspect", "itertools", "keyword", "math",
-        "pathlib", "re", "sys", "types", "typing", "warnings", 0};
+        "_pyrun", "_pyvalidate", "abc", "annotationlib", "asyncio",
+        "bisect", "collections", "collections.abc", "contextlib",
+        "contextvars", "copy", "dataclasses", "datetime", "decimal",
+        "enum", "fractions", "functools", "gc", "heapq", "inspect", "io",
+        "itertools", "json", "keyword", "math", "numbers", "operator",
+        "os", "pathlib", "random", "re", "statistics", "string", "struct",
+        "sys", "textwrap", "time", "tomllib", "traceback", "types",
+        "typing", "unicodedata", "warnings", "weakref", 0};
     const char *want = O(name)->kind == APY_STR_K ? APY_CSTR(name) : "";
     int i;
     for (i = 0; known[i]; i++)

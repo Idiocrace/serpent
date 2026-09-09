@@ -58,9 +58,15 @@ built.
        traceback  warnings  inspect                  surface
     4  math  decimal  fractions  statistics          numeric and temporal
        random  datetime  zoneinfo
-    5  time  socket  threading  subprocess  select   NEEDS THE FLOOR TO GROW
+    5  socket  threading  subprocess  select        NEEDS THE FLOOR TO GROW
+       (`time` is DONE -- see below)
 
-**Tier 5 is a different kind of work and is not scheduled here.** Those modules
+**Tier 5 is a different kind of work and is not scheduled here.** `time`
+came out of it: the tier was a claim about the FLOOR, and
+`objects/hostsvc.py` already declares a `time` group
+(`host_time_unix`, `host_time_monotonic`, `host_sleep`), so the module
+needed no new platform function and no `ctypes` declaration. The rest of
+the tier is still what the paragraph below says. Those modules
 need real syscalls, and the platform floor is deliberately three functions
 (`docs/INERT-RUNTIME.md`). Each one is a decision about that floor rather than
 a porting job -- and `ctypes` has just changed the arithmetic, because a C
@@ -140,11 +146,13 @@ while the object is still in use:
   maintained well enough to cascade from -- `_invoke_obj` pins and unpins a
   closure around every call to it, and that unpin found the count at zero.
   So a captured value outlives the closure that captured it.
-* a value read back out of a container into a temporary and then discarded,
-  in a function containing a LOOP. `_analyze` retires a temporary at its
-  last STATIC read, which is only the last dynamic one when the function
-  has no back edge; a loop switches the whole optimisation off for that
-  function.
+* anything in a function containing a LOOP. `_analyze` retires a temporary
+  at its last STATIC read, which is only the last dynamic one when the
+  function has no back edge, so a loop switches the whole optimisation off
+  for that function and every temporary in it waits for frame teardown.
+  What that is usually visible as is ORDER rather than lateness: `for it in
+  items` leaves `it` holding the last element, so that one outlives the
+  list and its `__del__` runs after the others' instead of first.
 * everything still alive when the PROGRAM ENDS. CPython runs a final
   collection at interpreter shutdown and a `__del__` still pending then runs
   there; this stops instead. What a program prints before its last statement
@@ -195,6 +203,7 @@ while the object is still in use:
 | `statistics` | `mean`, `fmean` (`weights=`), `geometric_mean`, `harmonic_mean` (`weights=`), `median`/`median_low`/`median_high`/`median_grouped`, `mode`, `multimode`, `variance`/`pvariance`, `stdev`/`pstdev`, `quantiles` (exclusive/inclusive), `covariance`, `correlation` (linear/ranked), `linear_regression`, `NormalDist` (full surface, including `pdf`/`cdf`/`inv_cdf`/`samples`/`from_samples` and arithmetic). `mean`/`variance`/`stdev`/`harmonic_mean` sum exactly through `Fraction` (CPython's own private `_sum`/`_ss`, ported) rather than a naive float loop, and `stdev`/`pstdev` finish with a correctly-rounded rational square root rather than double-rounding. NOT `Decimal` interop, `NormalDist.overlap`, `kde`/`kde_random` -- each needs a transcendental function this runtime does not have. |
 | `datetime` | `timedelta` (all seven constructor keywords, CPython's exact normalization, full arithmetic/comparison), `date` (construction, `.today`/`.fromordinal`/`.fromtimestamp`, `.weekday`/`.isocalendar`, `.isoformat`/`.strftime` for the common directives, `.replace`, arithmetic, comparison including against `datetime`), `time` (construction incl. `tzinfo`/`fold`, `.isoformat` with every timespec, naive/aware comparison), `timezone` (fixed-offset only, a real `utc` singleton), `datetime` (`.now`/`.utcnow`/`.fromtimestamp`, `.combine`, `.timestamp`, `.astimezone`, `.strftime`/`.strptime`, arithmetic, comparison). NOT `zoneinfo`/real IANA timezones, `fromisoformat`, `ctime`, `__format__`, pickling; there is no host timezone lookup, so a naive `now()`/`fromtimestamp()` treats local time as UTC. |
 | `traceback` | `format_exception_only`, `format_exception`, `print_exception`, `format_tb`/`print_tb`, `extract_tb`, `StackSummary`, `FrameSummary`, `TracebackException`/`.from_exception` -- exception chaining (`raise X from Y`, implicit `__context__`, `from None`), `__notes__`, and the ONE real frame `e.__traceback__` carries. NOT `format_exc`/`print_exc` -- there is no `sys.exc_info`; a bare `raise` resolves at COMPILE TIME against a lexical stack of enclosing `except` blocks rather than runtime thread state, so these are refused as fundamentally unimplementable rather than merely unwritten -- `walk_tb`/`walk_stack`/`extract_stack`/`format_stack`/`print_stack` (no call stack to walk), quoted source lines (`co_filename` is always `<compiled>`), `SyntaxError`'s multi-line format, `BaseExceptionGroup`'s tree format. |
+| `time` | `time`/`time_ns`, `monotonic`/`monotonic_ns`, `perf_counter`/`perf_counter_ns`, `process_time`/`process_time_ns`, `sleep`; `struct_time` (indexed and named, comparable against a plain tuple, CPython's `repr`, and `tm_gmtoff`/`tm_zone` named but NOT indexed); `gmtime`, `localtime`, `mktime` (normalising an out-of-range field, and inverting `localtime` exactly); `asctime`, `ctime`; `strftime` over the C-locale directives including `%G`/`%V` ISO week numbers, with an unknown directive copied through as glibc does rather than raising; `strptime` including `asctime`'s default format, `%j`, the 12-hour family and the 69/68 two-digit-year pivot; `timezone`, `altzone`, `daylight`, `tzname`. THE FIRST TIER-5 MODULE, and it needed no new platform function: `objects/hostsvc.py` already declares a `time` group, so every backend answering it gets this. LOCAL TIME IS UTC -- there is no timezone database and no host call that would reach one -- so `localtime` is `gmtime`'s fields and the four constants say UTC; exact on a machine running UTC and off by a fixed offset elsewhere. NOT `thread_time`, `get_clock_info`, `clock_gettime`/`CLOCK_*`, `tzset`, or a non-C locale's `%c`/`%x`/`%X` -- each refused BY NAME. |
 | `sys` (`getrefcount`) | `sys.getrefcount(obj)`, answering the shadow count. EXACT against CPython 3.14 for every reference a PROGRAM makes -- a name bound and unbound, a list or set membership, a dict value, an instance attribute, and each of those removed again. ONE SHAPE READS ONE HIGHER: a function asking about its own PARAMETER, since that binding is a counted reference here and one CPython 3.14's interpreter borrows from the caller instead. INTERPRETER-ONLY. The rest of `sys` is unchanged and stays in `frontends/python/modules.py`'s native table. |
 | `gc` | `collect()` -- a real cycle collector, CPython's own algorithm: subtract the references a candidate set makes to ITSELF from its members' counts, and whatever is left with nothing outside pointing at it is garbage. Finalizes it (`__del__`, weakref callbacks) and answers how many. `isenabled()`. INTERPRETER-ONLY, like `weakref` and for the same reason. NOT `enable`/`disable`, thresholds, `get_objects`/`get_referrers`/`get_referents`/`get_stats`, the debug flags, `garbage`, `freeze`/`unfreeze`, `is_tracked` -- there are no generations and no automatic runs here, so each would be a knob attached to nothing; refused BY NAME. |
 | `weakref` | `ref(obj)` and `ref(obj, callback)`, calling a ref to get the referent or `None`, the interning of callback-free refs (`ref(o) is ref(o)`, as CPython interns them), `__eq__`/`__hash__`, `getweakrefcount`, and the `TypeError` for a target that cannot be weakly referenced. The callback fires when the referent's last reference drops and receives the REF, per CPython's convention. INTERPRETER-ONLY: it reads the shadow reference count below, which a compiled build does not keep, so its two primitives refuse BY NAME there. NOT `proxy`, `finalize`, `WeakValueDictionary`, `WeakKeyDictionary`, `WeakSet` -- each refused BY NAME, and each for its own reason (see the module docstring). |
