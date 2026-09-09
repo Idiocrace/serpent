@@ -5003,9 +5003,21 @@ class Instance:
         out = self._send("__bool__")
         if out is NotImplemented:
             out = self._send("__len__")
-            # No `__bool__` and no `__len__` is ALWAYS TRUE. Answering False
-            # would silently invert every bare `if obj:`.
-            return True if out is NotImplemented else bool(out)
+            if out is NotImplemented:
+                # A CLASS EXTENDING A BUILTIN IS TRUTHY BY THE BUILTIN'S OWN
+                # RULE, exactly as `_apy_len` already answers `len(d)` from
+                # `held` for the same class rather than raising -- `class
+                # S(list): pass` with nothing in its own body still has to
+                # answer False once emptied, the way an ordinary `[]` does.
+                # `_send` only ever finds a dunder the CLASS ITSELF wrote,
+                # which is why this is not already covered above.
+                if self.held is not None:
+                    return bool(self.held)
+                # No `__bool__`, no `__len__`, and nothing held is ALWAYS
+                # TRUE. Answering False would silently invert every bare
+                # `if obj:`.
+                return True
+            return bool(out)
         return bool(out)
 
     def __len__(self):
