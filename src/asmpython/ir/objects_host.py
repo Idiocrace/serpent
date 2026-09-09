@@ -7006,13 +7006,27 @@ def _meta_check(h, cls, other, hook_name):
     """`__instancecheck__` / `__subclasscheck__` on the metaclass, if it has
     one. Asked BEFORE anything structural, which is what lets a metaclass
     claim a class it has no relationship to -- and answers a BOOL whatever the
-    hook returned, as CPython does."""
+    hook returned, as CPython does.
+
+    `_UserFailed` IS CAUGHT HERE, matching every other call site that invokes
+    a value the program wrote: a hook that RAISES -- `typing.Protocol`'s
+    `__instancecheck__` refusing a non-`@runtime_checkable` class with
+    `TypeError`, for one -- otherwise propagated as a raw Python exception
+    out of the whole interpreter instead of the program's own `try/except`,
+    because nothing between here and the top level was watching for it. `0`
+    is NULL/failure, the same sentinel every other guarded host binding
+    returns; the caller already treats "not None" as "decided", so a failure
+    here is handed back exactly like a real answer would be.
+    """
     if not isinstance(cls, Class) or cls.meta is None:
         return None
     hook = cls.meta.lookup(hook_name)
     if hook is _ABSENT:
         return None
-    return h._new(bool(h._invoke(hook, [cls, other])))
+    try:
+        return h._new(bool(h._invoke(hook, [cls, other])))
+    except _UserFailed:
+        return 0
 
 
 def _names_object(h, v) -> bool:
