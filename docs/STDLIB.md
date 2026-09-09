@@ -58,21 +58,59 @@ built.
        traceback  warnings  inspect                  surface
     4  math  decimal  fractions  statistics          numeric and temporal
        random  datetime  zoneinfo
-    5  socket  threading  subprocess  select        NEEDS THE FLOOR TO GROW
-       (`time` is DONE -- see below)
+    5  time  threading  socket  select            THE FLOOR GREW -- below
+       subprocess
 
-**Tier 5 is a different kind of work and is not scheduled here.** `time`
-came out of it: the tier was a claim about the FLOOR, and
-`objects/hostsvc.py` already declares a `time` group
-(`host_time_unix`, `host_time_monotonic`, `host_sleep`), so the module
-needed no new platform function and no `ctypes` declaration. The rest of
-the tier is still what the paragraph below says. Those modules
-need real syscalls, and the platform floor is deliberately three functions
-(`docs/INERT-RUNTIME.md`). Each one is a decision about that floor rather than
-a porting job -- and `ctypes` has just changed the arithmetic, because a C
-library can now be called with a declared signature and no new platform
-function at all. `time.time()` through `ctypes` is worth trying before
-`time` is written by hand.
+**Tier 5 was a claim about the FLOOR, and it was mostly wrong.** Four of
+the five modules came out of it, each for its own reason, and the reason
+is worth recording because it is the same mistake a reader could make
+again:
+
+* `time` needed no new platform function at all. `objects/hostsvc.py`
+  already declared a `time` group (`host_time_unix`,
+  `host_time_monotonic`, `host_sleep`) and nobody had noticed.
+* `socket` and `select` needed a group that was DECLARED AND IMPLEMENTED
+  NOWHERE. `net` had been sitting in `hostsvc.py` with a comment saying
+  streams only and blocking, and no backend answered any of it -- so the
+  floor did not have to grow, it had to be BUILT OUT: the interpreter now
+  calls CPython's `socket` and the C backend calls BSD sockets, and both
+  run `tests/stdlib/socket.py` identically. Two operations were added to
+  the group along the way (`host_net_port`, `host_net_ready`), because a
+  contract that cannot report which ephemeral port it got, or whether a
+  descriptor would block, cannot be used by the modules it exists for.
+* `threading` still cannot have a second thread -- that part of the claim
+  stands -- but most of the module is not the scheduler. Its locks,
+  semaphores, events, conditions, barriers and thread-local storage are
+  state machines that answer exactly what CPython answers on one thread,
+  and only `Thread` itself diverges.
+
+* `subprocess` is the one the claim was actually about: creating a
+  process is the largest single addition to the floor of anything here,
+  and there was no group waiting. `proc` is that addition, and it is ONE
+  operation -- `host_proc_run` -- for a reason the module docstring gives
+  at length: a live child with pipes needs a thread to drain them.
+  `fork`/`execvp`/`waitpid` in the C backend, CPython's `subprocess` in
+  the interpreter, and the same answers from both.
+
+THE LESSON IS THAT THE DECISION IS PER MODULE AND NOT PER TIER. "Needs
+the floor to grow" was false for `time`, false for `socket` and `select`
+(the group was there, unimplemented), true for only part of `threading`,
+and true for `subprocess` -- where the growth turned out to be one
+operation rather than a redesign. The floor is still three MANDATORY
+functions (`docs/INERT-RUNTIME.md`); everything added here is an OPTIONAL
+group a backend declares, and a program using one a backend does not have
+is still refused at compile time naming the group.
+
+WHAT WRITING THESE FOUND, which is the argument for writing library code
+in the language being compiled: a `@property` on an exception subclass
+handed the program the descriptor OBJECT, and a `__str__` on one was
+ignored in favour of the args. Both are fixed in `ir/objects_host.py`.
+`bytearray.append` and `.extend` did not exist at all -- `.append` on the
+most ordinary way there is to build one up answered `'bytearray' object
+has no attribute 'append'` -- and are now in `_apy_seq_push`/`_apy_extend`
+beside the list's. Three bugs, all found by writing library code in the
+language being compiled, which is the whole argument for doing it that
+way.
 
 ## What is not the standard library
 
@@ -114,7 +152,11 @@ argument buffer, which is every method call, every class instantiation and
 or cleared; `x is None` on a value nothing else holds; a reference CYCLE
 broken by `gc.collect()`, and one NOT broken by it because something outside
 still points at the cycle; `sys.getrefcount` for every reference a program
-itself makes. The ORDER several objects dying at the same moment are
+itself makes; and THE FINAL COLLECTION AT SHUTDOWN -- a `__del__` still
+pending when the last statement finishes runs, after the program's own
+output, exactly as CPython's does, with the module's globals dropped in the
+order they were bound so a global list finalizes its elements and a closure
+its captured variable. The ORDER several objects dying at the same moment are
 finalized in is exact too, for the three shapes that have one: a frame's
 locals go in reverse (CPython's own order, checked), a list's elements go in
 reverse (CPython's `list_dealloc` walks its array backwards), and a dict's
@@ -153,10 +195,10 @@ while the object is still in use:
   What that is usually visible as is ORDER rather than lateness: `for it in
   items` leaves `it` holding the last element, so that one outlives the
   list and its `__del__` runs after the others' instead of first.
-* everything still alive when the PROGRAM ENDS. CPython runs a final
-  collection at interpreter shutdown and a `__del__` still pending then runs
-  there; this stops instead. What a program prints before its last statement
-  matches; what CPython prints after it does not.
+* the ORDER of a shutdown collection when several objects die together and
+  one of them is also held by something the run over-held. Everything that
+  should finalize does (see below); which of two `__del__`s prints first can
+  differ.
 * `sys.getrefcount(o)` asked by a function ABOUT ITS OWN PARAMETER reads one
   higher: that binding is a counted reference here and CPython's interpreter
   borrows it from the caller's frame. Every reference a PROGRAM makes -- a
@@ -204,6 +246,10 @@ while the object is still in use:
 | `datetime` | `timedelta` (all seven constructor keywords, CPython's exact normalization, full arithmetic/comparison), `date` (construction, `.today`/`.fromordinal`/`.fromtimestamp`, `.weekday`/`.isocalendar`, `.isoformat`/`.strftime` for the common directives, `.replace`, arithmetic, comparison including against `datetime`), `time` (construction incl. `tzinfo`/`fold`, `.isoformat` with every timespec, naive/aware comparison), `timezone` (fixed-offset only, a real `utc` singleton), `datetime` (`.now`/`.utcnow`/`.fromtimestamp`, `.combine`, `.timestamp`, `.astimezone`, `.strftime`/`.strptime`, arithmetic, comparison). NOT `zoneinfo`/real IANA timezones, `fromisoformat`, `ctime`, `__format__`, pickling; there is no host timezone lookup, so a naive `now()`/`fromtimestamp()` treats local time as UTC. |
 | `traceback` | `format_exception_only`, `format_exception`, `print_exception`, `format_tb`/`print_tb`, `extract_tb`, `StackSummary`, `FrameSummary`, `TracebackException`/`.from_exception` -- exception chaining (`raise X from Y`, implicit `__context__`, `from None`), `__notes__`, and the ONE real frame `e.__traceback__` carries. NOT `format_exc`/`print_exc` -- there is no `sys.exc_info`; a bare `raise` resolves at COMPILE TIME against a lexical stack of enclosing `except` blocks rather than runtime thread state, so these are refused as fundamentally unimplementable rather than merely unwritten -- `walk_tb`/`walk_stack`/`extract_stack`/`format_stack`/`print_stack` (no call stack to walk), quoted source lines (`co_filename` is always `<compiled>`), `SyntaxError`'s multi-line format, `BaseExceptionGroup`'s tree format. |
 | `time` | `time`/`time_ns`, `monotonic`/`monotonic_ns`, `perf_counter`/`perf_counter_ns`, `process_time`/`process_time_ns`, `sleep`; `struct_time` (indexed and named, comparable against a plain tuple, CPython's `repr`, and `tm_gmtoff`/`tm_zone` named but NOT indexed); `gmtime`, `localtime`, `mktime` (normalising an out-of-range field, and inverting `localtime` exactly); `asctime`, `ctime`; `strftime` over the C-locale directives including `%G`/`%V` ISO week numbers, with an unknown directive copied through as glibc does rather than raising; `strptime` including `asctime`'s default format, `%j`, the 12-hour family and the 69/68 two-digit-year pivot; `timezone`, `altzone`, `daylight`, `tzname`. THE FIRST TIER-5 MODULE, and it needed no new platform function: `objects/hostsvc.py` already declares a `time` group, so every backend answering it gets this. LOCAL TIME IS UTC -- there is no timezone database and no host call that would reach one -- so `localtime` is `gmtime`'s fields and the four constants say UTC; exact on a machine running UTC and off by a fixed offset elsewhere. NOT `thread_time`, `get_clock_info`, `clock_gettime`/`CLOCK_*`, `tzset`, or a non-C locale's `%c`/`%x`/`%X` -- each refused BY NAME. |
+| `subprocess` | `run()` with `capture_output`, `stdout=PIPE`, `stderr=PIPE`, `stderr=STDOUT`, `text=`/`encoding=`, `check=`, and a list or a `str` with `shell=True`; `CompletedProcess` with `.args`/`.returncode`/`.stdout`/`.stderr`/`.check_returncode()`; `check_output`, `check_call`, `call`, `getoutput`, `getstatusoutput`; `CalledProcessError` (message copied from CPython's source, so a list command reads `Command '['false']'` exactly as there) and `SubprocessError`; `PIPE`, `STDOUT`, `DEVNULL`. A REAL CHILD PROCESS: the new `proc` host-service group is `fork`/`execvp`/`waitpid` over two pipes in the C backend and CPython's own `subprocess` in the interpreter, so `tests/stdlib/subprocess.py` passes interpreted AND as a linked binary. ONE OPERATION, not a `Popen`: a pipe you write to while the child writes back needs someone to drain the other end, and a runtime with one thread has nobody -- so the group promises the shape that is always safe (run to completion, then read) and `Popen` is refused BY NAME rather than offered as something that hangs. `shell=True` builds the shell's own argv (`["/bin/sh", "-c", cmd]`) here, where a reader can see it, so nothing below has to quote a list into a string. NOT `Popen` and everything needing a live child, `input=`, `timeout=`, `cwd=`, `env=`, `preexec_fn`; and NOT capture on Windows, where the group runs the child with inherited stdio because capturing there needs `CreateProcess` and two structs a hand-written prototype gets silently wrong. THE CAPTURE BUFFER IS 8 KiB and a child that writes more raises rather than half-reporting. |
+| `socket` | `socket(AF_INET, SOCK_STREAM)` -- `connect`, `bind`, `listen`, `accept`, `send`, `sendall`, `recv`, `recv_into`, `close`, `fileno`, `getsockname`, `connect_ex`, `detach`, `shutdown`, and the context-manager protocol; `create_connection`, `create_server`; `inet_aton`/`inet_ntoa`, `htons`/`ntohs`/`htonl`/`ntohl`, `gethostname`, `getaddrinfo` for a numeric address; `error` as an alias of `OSError` (as CPython's is), `timeout`, `gaierror`, `herror`, and the constants. A REAL TCP ROUND TRIP, over the `net` host-service group -- which was DECLARED in `objects/hostsvc.py` and implemented nowhere until now, and is implemented twice: `ir/hostsvc_host.py` calls CPython's `socket` and `C_SOURCE["net"]` calls BSD sockets (Winsock on Windows), so `tests/stdlib/socket.py` passes interpreted AND as a linked binary. Two operations were added to the group to make it usable: `host_net_port`, so a program that asks for an ephemeral port with `bind(("", 0))` can find out which one it got, and `host_net_ready`, which `select` is built from. STREAMS ONLY AND BLOCKING, which is the group's own contract: NOT `SOCK_DGRAM`/`sendto`/`recvfrom`, NOT `settimeout`/`setblocking(False)`, NOT `AF_INET6`/`AF_UNIX`/`ssl`/`makefile`, and NOT name resolution -- an address is numeric, and a name raises `gaierror` saying so, which is the exception CPython raises when a name does not resolve. |
+| `select` | `select(rlist, wlist, xlist, timeout)` over sockets or bare descriptors, answering the OBJECTS that were passed; `poll()` with `register`/`modify`/`unregister`/`poll`, and `POLLIN`/`POLLOUT`/`POLLERR`/`POLLHUP`/`POLLNVAL`; `error` as `OSError`; `PIPE_BUF`. Built on the `net` group's `host_net_ready`, which asks about ONE descriptor -- a set would be a second ABI for every backend to agree on, for a loop the caller can write, and this module is that loop. A TIMEOUT OF 0 IS EXACT, which is the poll every event loop actually does; a POSITIVE timeout polls the whole set, then waits the remainder on the FIRST descriptor before polling once more, so a wait wakes on that one rather than on any of them. NOT the exceptional set (out-of-band data is a socket option the `net` group does not have), `epoll`/`kqueue`/`devpoll`, or `select` on a file -- `host_net_ready` knows about the sockets the group opened and nothing else. |
+| `threading` | `Lock`, `RLock`, `Semaphore`, `BoundedSemaphore`, `Event`, `Condition`, `Barrier`, `local` and `Thread`; `current_thread`/`main_thread`/`active_count`/`get_ident`/`enumerate`, `TIMEOUT_MAX`, `BrokenBarrierError`. THE SYNCHRONIZATION PRIMITIVES ARE EXACT and are most of the module: they are state machines over a counter and a flag, so `acquire`/`release` pairing, the reentrancy count, `locked()`, the `RuntimeError` for releasing an un-acquired lock, the `ValueError` for over-releasing a bounded semaphore, `Event`'s set/clear/wait, `wait_for` on a predicate that already holds, and every one of them as a context manager all answer what CPython answers. THE SCHEDULER IS THE DIVERGENCE, and it is the part that genuinely needs the floor to grow: a `Thread` runs its target on the calling thread at `start()`, so `t.start(); t.is_alive()` is deterministically False here and a RACE in CPython, and two threads' output is sequential rather than interleaved. What holds either way -- the target running once with its arguments, `join`, `is_alive` before start and after join, an exception reported rather than propagated -- is what a program checks. An operation whose only single-threaded outcome is to wait for a thread that cannot exist (a blocking re-acquire of a `Lock`, `Condition.wait()`, a multi-party `Barrier.wait()`) raises `RuntimeError` naming the deadlock rather than hanging; CPython deadlocks there, so no correct program reaches one. NOT `Timer`, `settrace`/`setprofile`/`stack_size`, `excepthook` as a replaceable hook, or `get_native_id` -- each refused BY NAME. |
 | `sys` (`getrefcount`) | `sys.getrefcount(obj)`, answering the shadow count. EXACT against CPython 3.14 for every reference a PROGRAM makes -- a name bound and unbound, a list or set membership, a dict value, an instance attribute, and each of those removed again. ONE SHAPE READS ONE HIGHER: a function asking about its own PARAMETER, since that binding is a counted reference here and one CPython 3.14's interpreter borrows from the caller instead. INTERPRETER-ONLY. The rest of `sys` is unchanged and stays in `frontends/python/modules.py`'s native table. |
 | `gc` | `collect()` -- a real cycle collector, CPython's own algorithm: subtract the references a candidate set makes to ITSELF from its members' counts, and whatever is left with nothing outside pointing at it is garbage. Finalizes it (`__del__`, weakref callbacks) and answers how many. `isenabled()`. INTERPRETER-ONLY, like `weakref` and for the same reason. NOT `enable`/`disable`, thresholds, `get_objects`/`get_referrers`/`get_referents`/`get_stats`, the debug flags, `garbage`, `freeze`/`unfreeze`, `is_tracked` -- there are no generations and no automatic runs here, so each would be a knob attached to nothing; refused BY NAME. |
 | `weakref` | `ref(obj)` and `ref(obj, callback)`, calling a ref to get the referent or `None`, the interning of callback-free refs (`ref(o) is ref(o)`, as CPython interns them), `__eq__`/`__hash__`, `getweakrefcount`, and the `TypeError` for a target that cannot be weakly referenced. The callback fires when the referent's last reference drops and receives the REF, per CPython's convention. INTERPRETER-ONLY: it reads the shadow reference count below, which a compiled build does not keep, so its two primitives refuse BY NAME there. NOT `proxy`, `finalize`, `WeakValueDictionary`, `WeakKeyDictionary`, `WeakSet` -- each refused BY NAME, and each for its own reason (see the module docstring). |

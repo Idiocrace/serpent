@@ -20,15 +20,17 @@
 import os
 import time as _time
 
+
 #: Returned for a name this file does not implement, so the caller falls
 #: through to its own trap. The same sentinel arrangement as
 #: `objects_host.NOT_MINE` and `natives_host.NOT_MINE`.
 NOT_MINE = object()
 
-#: WHAT THE INTERPRETER CAN DO. Everything but `net` and `text`: the first is
-#: not written yet on any backend, and the second wants the Unicode table
-#: wired to these names rather than a second copy of it here.
-GROUPS = frozenset({"file", "time", "random", "env"})
+#: WHAT THE INTERPRETER CAN DO. Everything but `text`, which wants the
+#: Unicode table wired to these names rather than a second copy of it here.
+#: `net` used to be excluded too, on the grounds that it was "not written yet
+#: on any backend" -- it is now written on both this one and the C one.
+GROUPS = frozenset({"file", "time", "random", "env", "net", "proc"})
 
 #: `objects/hostsvc.py`'s error table, which is NOT errno -- see there for why.
 _ERR, _ENOENT, _EACCES, _EEXIST = -1, -2, -3, -4
@@ -319,6 +321,212 @@ def _host_arg_get(interp, a):
     return len(raw)
 
 
+# ── the network ─────────────────────────────────────────────────────────────
+#
+# STREAMS ONLY AND BLOCKING, which is the contract `objects/hostsvc.py`
+# declares; nothing here widens it. The C backend calls BSD sockets and this
+# calls Python's `socket`, and the two have to agree on the one thing a
+# program can see -- a DESCRIPTOR, an integer it hands back.
+#
+# A DESCRIPTOR AND NOT A HANDLE. CPython's `socket.socket` object owns a real
+# file descriptor and `fileno()` is it, so answering that number makes this
+# side's descriptors mean the same thing the C side's do: the program holds an
+# int either way, and a `net` descriptor is never confused with a `file` one
+# because the operating system numbers them from one pool. The socket OBJECT
+# is kept alive in `_SOCKETS` only because CPython closes the descriptor when
+# the object is collected, which would pull the rug out from under a program
+# still holding the number.
+
+#: fd -> the CPython socket object that owns it. See above.
+_SOCKETS: dict = {}
+
+
+def _sock_error(exc):
+    """One of `objects/hostsvc.py`'s codes for an `OSError` -- the same
+    translation `_err` does for the file group, reached from here because a
+    socket failure is an `OSError` with the same `errno` vocabulary."""
+    return _err(exc)
+
+
+def _host_net_connect(interp, a):
+    import socket as _socket
+    host = _path(interp, int(a[0]), int(a[1]))
+    port = int(a[2])
+    if host is None or not 0 <= port <= 65535:
+        return _EINVAL
+    try:
+        sock = _socket.create_connection((host, port))
+    except OSError as exc:
+        return _sock_error(exc)
+    _SOCKETS[sock.fileno()] = sock
+    return sock.fileno()
+
+
+def _host_net_listen(interp, a):
+    import socket as _socket
+    port, backlog = int(a[0]), int(a[1])
+    if not 0 <= port <= 65535:
+        return _EINVAL
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        # REUSEADDR, because a listener that has just closed leaves the port
+        # in TIME_WAIT and the next run of the same program is refused. Every
+        # server does this and the C side below does it too, so leaving it out
+        # here would make the two disagree about whether a program can be run
+        # twice.
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", port))
+        sock.listen(max(1, backlog))
+    except OSError as exc:
+        sock.close()
+        return _sock_error(exc)
+    _SOCKETS[sock.fileno()] = sock
+    return sock.fileno()
+
+
+def _host_net_accept(interp, a):
+    sock = _SOCKETS.get(int(a[0]))
+    if sock is None:
+        return _EINVAL
+    try:
+        conn, _ = sock.accept()
+    except OSError as exc:
+        return _sock_error(exc)
+    _SOCKETS[conn.fileno()] = conn
+    return conn.fileno()
+
+
+def _host_net_read(interp, a):
+    sock = _SOCKETS.get(int(a[0]))
+    addr, cap = int(a[1]), int(a[2])
+    if sock is None or cap < 0:
+        return _EINVAL
+    try:
+        got = sock.recv(cap)
+    except OSError as exc:
+        return _sock_error(exc)
+    _fill(interp, addr, got)
+    # ZERO IS END OF STREAM, not an error -- the peer closed its end. Every
+    # error in this table is negative, so the two never collide.
+    return len(got)
+
+
+def _host_net_write(interp, a):
+    sock = _SOCKETS.get(int(a[0]))
+    addr, n = int(a[1]), int(a[2])
+    if sock is None or n < 0:
+        return _EINVAL
+    data = bytes(interp.mem.buf[addr:addr + n])
+    try:
+        return sock.send(data)
+    except OSError as exc:
+        return _sock_error(exc)
+
+
+def _host_net_close(interp, a):
+    sock = _SOCKETS.pop(int(a[0]), None)
+    if sock is None:
+        return _EINVAL
+    try:
+        sock.close()
+    except OSError as exc:
+        return _sock_error(exc)
+    return 0
+
+
+def _host_proc_run(interp, a):
+    """Run another program to completion and collect what it said.
+
+    ARGV IS NUL-SEPARATED in one buffer with a count -- see the group's own
+    comment in `objects/hostsvc.py` for why it is not a shell string and
+    not an array of pointers. `shell=True` never reaches here: the module
+    above builds the shell's own argv (`["/bin/sh", "-c", command]`) and
+    hands it over like any other, so the decision to involve a shell is
+    made where a reader can see it rather than by a flag down here.
+    """
+    import subprocess as _subprocess
+    packed, count = int(a[0]), int(a[1])
+    packed_len = int(a[2])
+    out_at, out_cap = int(a[3]), int(a[4])
+    err_at, err_cap = int(a[5]), int(a[6])
+    status_at = int(a[7])
+    if count <= 0 or packed_len < 0:
+        return _EINVAL
+    raw = _bytes(interp, packed, packed_len)
+    parts = raw.split(b"\x00")
+    # A TRAILING SEPARATOR LEAVES AN EMPTY PIECE, which is not an argument.
+    while parts and parts[-1] == b"":
+        parts.pop()
+    if len(parts) != count:
+        return _EINVAL
+    argv = [os.fsdecode(one) for one in parts]
+    try:
+        done = _subprocess.run(argv, capture_output=True)
+    except FileNotFoundError:
+        return _ENOENT
+    except PermissionError:
+        return _EACCES
+    except OSError as exc:
+        return _err(exc)
+    _fill(interp, out_at, done.stdout[:out_cap])
+    _fill(interp, err_at, done.stderr[:err_cap])
+    # THROUGH `_fill`, NOT `mem.write`. A `bytearray` argument arrives as an
+    # ADDRESS of a COPY -- `objects_host._apy_str_bytes` copies the host
+    # object's bytes into interpreter memory and answers where -- so writing
+    # only to that copy leaves the program's own buffer full of zeroes, and
+    # the exit status read back as 0 for every child. The same trap `_fill`
+    # exists for; see its own docstring.
+    code = done.returncode & ((1 << 64) - 1)
+    _fill(interp, status_at,
+          bytes([(code >> (8 * i)) & 0xff for i in range(8)]))
+    # THE LENGTH IT NEEDED, not the length written -- see `host_env_get`.
+    # stderr's own length is the one thing a caller cannot recover from
+    # this, so the module above passes a buffer big enough for both and
+    # re-runs nothing.
+    return len(done.stdout)
+
+
+def _host_net_ready(interp, a):
+    """Whether one descriptor would block. See the group's own comment in
+    `objects/hostsvc.py` for why this takes ONE descriptor rather than a
+    set: a set is a second ABI to keep in step, for a loop the caller can
+    write -- and `bundled/select.py` writes it."""
+    import select as _select
+    sock = _SOCKETS.get(int(a[0]))
+    want, timeout = int(a[1]), int(a[2])
+    if sock is None or want not in (1, 2):
+        return _EINVAL
+    seconds = None if timeout < 0 else timeout / 1e9
+    try:
+        if want == 1:
+            ready, _, _ = _select.select([sock], [], [], seconds)
+        else:
+            _, ready, _ = _select.select([], [sock], [], seconds)
+    except OSError as exc:
+        return _sock_error(exc)
+    return 1 if ready else 0
+
+
+def _host_net_port(interp, a):
+    """The port a listener actually bound to.
+
+    THE ONE OPERATION THE DECLARED GROUP WAS MISSING, and without it the
+    group cannot be used at all by a program that does not hard-code a port:
+    `listen(0)` asks the operating system to pick a free one -- which is what
+    every test and every ephemeral server does -- and there was no way to ask
+    which one it picked. Added rather than worked around, because the
+    alternative is every caller guessing a port number and racing whatever
+    else on the machine guessed the same.
+    """
+    sock = _SOCKETS.get(int(a[0]))
+    if sock is None:
+        return _EINVAL
+    try:
+        return int(sock.getsockname()[1])
+    except OSError as exc:
+        return _sock_error(exc)
+
+
 _TABLE = {
     "host_file_open": _host_file_open,
     "host_file_read": _host_file_read,
@@ -337,4 +545,13 @@ _TABLE = {
     "host_env_get": _host_env_get,
     "host_arg_count": _host_arg_count,
     "host_arg_get": _host_arg_get,
+    "host_net_connect": _host_net_connect,
+    "host_net_listen": _host_net_listen,
+    "host_net_accept": _host_net_accept,
+    "host_net_read": _host_net_read,
+    "host_net_write": _host_net_write,
+    "host_net_close": _host_net_close,
+    "host_net_port": _host_net_port,
+    "host_net_ready": _host_net_ready,
+    "host_proc_run": _host_proc_run,
 }

@@ -207,6 +207,28 @@ GROUPS: dict[str, dict[str, tuple[tuple[str, ...], str]]] = {
     # STREAMS ONLY, and blocking. Datagrams, non-blocking sockets and TLS are
     # each a larger contract than this whole file, and a backend that has one
     # can offer it as a group of its own rather than by widening this one.
+    # A DESCRIPTOR, and the same kind of number the `file` group hands out:
+    # opaque, belonging to whoever answered it, given back and never
+    # interpreted. `host_net_connect` takes a host name and a port and
+    # answers one; `host_net_listen` takes a port and a backlog and answers
+    # the LISTENER's, which `host_net_accept` turns into a connection's.
+    # `host_net_read` answers 0 at end of stream, which is distinguishable
+    # from every error because every error here is negative.
+    #
+    # `host_net_port` IS HOW A CALLER LEARNS WHICH PORT IT GOT. Passing 0 to
+    # `host_net_listen` asks the operating system for a free one -- what
+    # every ephemeral server and every test does -- and without this the
+    # answer was unobtainable, so the group could only be used by a program
+    # willing to hard-code a number and race whatever else chose the same.
+    #
+    # `host_net_ready` ASKS WHETHER ONE DESCRIPTOR WOULD BLOCK, and is what
+    # `select` is built from. `want` is 1 for readable and 2 for writable;
+    # `timeout` is nanoseconds, with a negative value meaning wait
+    # indefinitely and 0 meaning poll. It answers 1 for ready, 0 for timed
+    # out, and a negative code for an error. ONE DESCRIPTOR AND NOT A SET,
+    # because a set means an array layout every backend agrees on and a
+    # frontend can build -- a second ABI to keep in step, for a loop the
+    # caller can write. `bundled/select.py` writes that loop.
     "net": {
         "host_net_connect": (("ptr", "i64", "i64"), "i64"),
         "host_net_listen":  (("i64", "i64"), "i64"),
@@ -214,6 +236,35 @@ GROUPS: dict[str, dict[str, tuple[tuple[str, ...], str]]] = {
         "host_net_read":    (("i64", "ptr", "i64"), "i64"),
         "host_net_write":   (("i64", "ptr", "i64"), "i64"),
         "host_net_close":   (("i64",), "i64"),
+        "host_net_port":    (("i64",), "i64"),
+        "host_net_ready":   (("i64", "i64", "i64"), "i64"),
+    },
+    # ── another program ─────────────────────────────────────────────────
+    #
+    # RUN TO COMPLETION AND CAPTURE, which is one operation rather than the
+    # six a `Popen` would need. That is the shape because of what a
+    # single-threaded runtime can actually do: a pipe you write to while the
+    # child writes back needs someone to read the other end, and there is
+    # nobody. `subprocess.run(capture_output=True)` -- start it, wait for it,
+    # collect what it said -- is the whole of what a program here can ask
+    # for, so it is the whole of what this promises.
+    #
+    # ARGV IS NUL-SEPARATED, in one buffer, with a count. Not a shell string:
+    # quoting a list into one is where command injection comes from, and the
+    # separation a caller already has must not be thrown away and guessed at
+    # again. Not an array of pointers either -- that is a layout every
+    # backend would have to agree on, and this file's own rule is that a
+    # string crosses as a pointer and a length.
+    #
+    # THE TWO CAPTURE BUFFERS ANSWER THE LENGTH THEY NEEDED, exactly as
+    # `host_env_get` does: a caller that guessed too small sees a number
+    # larger than its buffer and calls again with a bigger one. The exit
+    # STATUS is written through `status`, because the return value is
+    # already carrying the stdout length and one call cannot answer two
+    # numbers.
+    "proc": {
+        "host_proc_run": (("ptr", "i64", "i64", "ptr", "i64", "ptr", "i64",
+                           "ptr"), "i64"),
     },
     # ── a dynamic library ───────────────────────────────────────────────
     #
@@ -275,7 +326,7 @@ MANDATORY = ("core",)
 
 #: The groups a backend may or may not offer.
 OPTIONAL = tuple(g for g in ("file", "time", "random", "env", "net",
-                             "dynlib", "text"))
+                             "proc", "dynlib", "text"))
 
 #: Every operation, flattened, for the places that want one dictionary.
 ALL: dict[str, tuple[tuple[str, ...], str]] = {
@@ -634,6 +685,396 @@ static char **apy_host_argv = 0;
     return len;
 }
 """
+
+C_SOURCE["net"] = r"""/* --- host services: net -------------------------------------------------- */
+
+/* NO HEADER, for the reason the `file` and `dynlib` groups both give at
+   length: `<sys/socket.h>` and `<winsock2.h>` declare a great deal besides
+   the seven calls wanted here, and every name they declare is one a `ctypes`
+   program may declare for itself -- two prototypes for one symbol do not
+   compile. So the prototypes are written out, and the two structs with them.
+
+   THE STRUCT IS THE PART THAT HAS TO BE EXACTLY RIGHT, because a wrong
+   layout is undefined behaviour rather than a compile error. `sockaddr_in`
+   is the same sixteen bytes on every platform this targets -- it is wire
+   format, not an ABI choice: a 16-bit family, a 16-bit port in NETWORK byte
+   order, a 32-bit address in network byte order, and eight bytes of padding
+   nothing reads. Written as a byte array plus explicit stores rather than as
+   a struct with named fields, so there is nothing for a compiler to pad
+   differently. */
+#ifdef _WIN32
+/* Winsock needs starting, and its descriptors are `SOCKET` (an unsigned
+   pointer-sized handle) rather than ints -- widened to int64_t here, which
+   is what the contract answers anyway. */
+typedef unsigned long long apy_socket_t;
+__declspec(dllimport) int __stdcall WSAStartup(unsigned short, void *);
+__declspec(dllimport) apy_socket_t __stdcall socket(int, int, int);
+__declspec(dllimport) int __stdcall connect(apy_socket_t, const void *, int);
+__declspec(dllimport) int __stdcall bind(apy_socket_t, const void *, int);
+__declspec(dllimport) int __stdcall listen(apy_socket_t, int);
+__declspec(dllimport) apy_socket_t __stdcall accept(apy_socket_t, void *, int *);
+__declspec(dllimport) int __stdcall recv(apy_socket_t, char *, int, int);
+__declspec(dllimport) int __stdcall send(apy_socket_t, const char *, int, int);
+__declspec(dllimport) int __stdcall closesocket(apy_socket_t);
+__declspec(dllimport) int __stdcall setsockopt(apy_socket_t, int, int,
+                                               const char *, int);
+__declspec(dllimport) int __stdcall getsockname(apy_socket_t, void *, int *);
+__declspec(dllimport) unsigned long __stdcall inet_addr(const char *);
+__declspec(dllimport) void * __stdcall gethostbyname(const char *);
+__declspec(dllimport) int __stdcall WSAPoll(void *, unsigned long, int);
+#define APY_NET_CLOSE(s)   closesocket(s)
+#define APY_NET_INVALID    ((apy_socket_t)~0)
+#define APY_NET_SOL_SOCKET 0xffff
+#define APY_NET_REUSEADDR  0x0004
+#else
+typedef int apy_socket_t;
+int socket(int, int, int);
+int connect(int, const void *, unsigned int);
+int bind(int, const void *, unsigned int);
+int listen(int, int);
+int accept(int, void *, unsigned int *);
+long recv(int, void *, unsigned long, int);
+long send(int, const void *, unsigned long, int);
+int close(int);
+int setsockopt(int, int, int, const void *, unsigned int);
+int getsockname(int, void *, unsigned int *);
+unsigned int inet_addr(const char *);
+void *gethostbyname(const char *);
+int poll(void *, unsigned long, int);
+#define APY_NET_CLOSE(s)   close(s)
+#define APY_NET_INVALID    (-1)
+#define APY_NET_SOL_SOCKET 1
+#define APY_NET_REUSEADDR  2
+#endif
+
+#define APY_AF_INET      2
+#define APY_SOCK_STREAM  1
+
+/* `sockaddr_in`, as the sixteen bytes it is. See the comment above on why
+   this is a byte array: the layout is wire format and writing it out by hand
+   is the only way to be sure a compiler has not padded it. */
+static void apy_net_addr(unsigned char *sa, unsigned int ip, int64_t port)
+{
+    int i;
+    for (i = 0; i < 16; i++) sa[i] = 0;
+    sa[0] = APY_AF_INET;                       /* sin_family, little end   */
+    sa[1] = 0;
+    sa[2] = (unsigned char)((port >> 8) & 0xff);   /* sin_port, network    */
+    sa[3] = (unsigned char)(port & 0xff);
+    /* `inet_addr` already answers network byte order, so the four bytes go
+       out in memory order rather than being byte-swapped again. */
+    sa[4] = (unsigned char)(ip & 0xff);
+    sa[5] = (unsigned char)((ip >> 8) & 0xff);
+    sa[6] = (unsigned char)((ip >> 16) & 0xff);
+    sa[7] = (unsigned char)((ip >> 24) & 0xff);
+}
+
+#define APY_NET_NAME_MAX 256
+static int apy_net_name(@PTR@ p, int64_t n, char *out)
+{
+    int64_t i;
+    if (n < 0 || n >= APY_NET_NAME_MAX) return 0;
+    for (i = 0; i < n; i++) {
+        char c = ((const char *)p)[i];
+        if (c == 0) return 0;
+        out[i] = c;
+    }
+    out[n] = 0;
+    return 1;
+}
+
+static void apy_net_start(void)
+{
+#ifdef _WIN32
+    /* ONCE. Winsock refuses every call before `WSAStartup`, and calling it
+       twice is harmless but pointless. 0x0202 is version 2.2. */
+    static int done = 0;
+    if (!done) { char data[512]; WSAStartup(0x0202, data); done = 1; }
+#endif
+}
+
+@STATIC@int64_t host_net_connect(@PTR@ host, int64_t n, int64_t port)
+{
+    char name[APY_NET_NAME_MAX];
+    unsigned char sa[16];
+    unsigned int ip;
+    apy_socket_t s;
+    if (port < 0 || port > 65535) return -9;
+    if (!apy_net_name(host, n, name)) return -9;
+    apy_net_start();
+    ip = (unsigned int)inet_addr(name);
+    /* NUMERIC ADDRESSES ONLY. `gethostbyname` would resolve a name, and
+       resolution is a larger contract than this group has -- it needs a
+       resolver, a timeout and an error vocabulary of its own. A caller with
+       a name resolves it before getting here; a caller without one passes
+       `127.0.0.1` and this works. */
+    if (ip == 0xffffffffu) return -9;
+    s = socket(APY_AF_INET, APY_SOCK_STREAM, 0);
+    if (s == APY_NET_INVALID) return -1;
+    apy_net_addr(sa, ip, port);
+    if (connect(s, sa, 16) != 0) { APY_NET_CLOSE(s); return -1; }
+    return (int64_t)s;
+}
+
+@STATIC@int64_t host_net_listen(int64_t port, int64_t backlog)
+{
+    unsigned char sa[16];
+    apy_socket_t s;
+    int on = 1;
+    if (port < 0 || port > 65535) return -9;
+    apy_net_start();
+    s = socket(APY_AF_INET, APY_SOCK_STREAM, 0);
+    if (s == APY_NET_INVALID) return -1;
+    /* REUSEADDR, or a listener that has just closed leaves the port in
+       TIME_WAIT and the next run of the same program is refused. The
+       interpreter's implementation sets it too, so the two agree about
+       whether a program can be run twice. */
+    setsockopt(s, APY_NET_SOL_SOCKET, APY_NET_REUSEADDR,
+               (const char *)&on, (unsigned int)sizeof on);
+    apy_net_addr(sa, inet_addr("127.0.0.1"), port);
+    if (bind(s, sa, 16) != 0) { APY_NET_CLOSE(s); return -1; }
+    if (listen(s, (int)(backlog > 0 ? backlog : 1)) != 0) {
+        APY_NET_CLOSE(s); return -1;
+    }
+    return (int64_t)s;
+}
+
+@STATIC@int64_t host_net_accept(int64_t fd)
+{
+    apy_socket_t c = accept((apy_socket_t)fd, 0, 0);
+    if (c == APY_NET_INVALID) return -1;
+    return (int64_t)c;
+}
+
+@STATIC@int64_t host_net_read(int64_t fd, @PTR@ buf, int64_t n)
+{
+    long got;
+    if (n < 0) return -9;
+    got = (long)recv((apy_socket_t)fd, (char *)buf, (unsigned long)n, 0);
+    /* ZERO IS END OF STREAM and is not an error: the peer closed its end.
+       Every error in this table is negative, so the two never collide. */
+    if (got < 0) return -1;
+    return (int64_t)got;
+}
+
+@STATIC@int64_t host_net_write(int64_t fd, @PTR@ buf, int64_t n)
+{
+    long put;
+    if (n < 0) return -9;
+    put = (long)send((apy_socket_t)fd, (const char *)buf, (unsigned long)n, 0);
+    if (put < 0) return -8;                    /* EPIPE: the peer is gone  */
+    return (int64_t)put;
+}
+
+@STATIC@int64_t host_net_close(int64_t fd)
+{
+    return APY_NET_CLOSE((apy_socket_t)fd) == 0 ? 0 : -1;
+}
+
+@STATIC@int64_t host_net_ready(int64_t fd, int64_t want, int64_t timeout)
+{
+    /* `poll`, and NOT `select`. Two reasons, and the second is the one that
+       decided it: `select`'s `fd_set` is a bitmap on POSIX and a counted
+       array on Windows, so it needs two implementations -- and glibc's
+       `<stdlib.h>` already brings `select` into scope through
+       `<sys/select.h>`, so declaring it here is a conflicting prototype and
+       does not compile. `poll` is declared by `<poll.h>`, which nothing here
+       includes, and its `struct pollfd` is three fields with no padding
+       question on either platform.
+
+       WINDOWS SPELLS IT `WSAPoll` and its descriptor is a pointer-sized
+       SOCKET rather than an int, which is the only difference -- so the
+       struct is written out per platform and the call is the same shape. */
+    int ready;
+#ifdef _WIN32
+    struct { apy_socket_t fd; short events; short revents; } pfd;
+    pfd.fd = (apy_socket_t)fd;
+    /* POLLRDNORM / POLLWRNORM: Winsock's names for the two conditions,
+       and the only two `WSAPoll` accepts on input. */
+    pfd.events = (short)(want == 1 ? 0x0100 : 0x0010);
+    pfd.revents = 0;
+    if (want != 1 && want != 2) return -9;
+    ready = WSAPoll(&pfd, 1, timeout < 0 ? -1 : (int)(timeout / 1000000));
+#else
+    struct { int fd; short events; short revents; } pfd;
+    if (want != 1 && want != 2) return -9;
+    pfd.fd = (int)fd;
+    /* POLLIN is 0x001 and POLLOUT is 0x004 on every POSIX platform this
+       targets -- they are in the standard, not the implementation. */
+    pfd.events = (short)(want == 1 ? 0x001 : 0x004);
+    pfd.revents = 0;
+    /* MILLISECONDS, which is what `poll` takes and why the contract's
+       nanoseconds are divided here rather than at every caller. A negative
+       timeout means wait indefinitely, in the contract and in `poll`. */
+    ready = poll(&pfd, 1, timeout < 0 ? -1 : (int)(timeout / 1000000));
+#endif
+    if (ready < 0) return -1;
+    return ready > 0 ? 1 : 0;
+}
+
+
+@STATIC@int64_t host_net_port(int64_t fd)
+{
+    unsigned char sa[16];
+    unsigned int len = 16;
+    int i;
+    for (i = 0; i < 16; i++) sa[i] = 0;
+    if (getsockname((apy_socket_t)fd, sa, &len) != 0) return -1;
+    /* NETWORK BYTE ORDER, read back the way `apy_net_addr` wrote it. */
+    return (int64_t)(((unsigned int)sa[2] << 8) | (unsigned int)sa[3]);
+}
+"""
+
+
+C_SOURCE["proc"] = r"""/* --- host services: proc ------------------------------------------------ */
+
+/* NO HEADER, as everywhere else in this file: `<unistd.h>` and
+   `<sys/wait.h>` declare a great deal besides the seven calls wanted here,
+   and every name they declare is one a `ctypes` program may declare for
+   itself. The prototypes are written out.
+
+   `fork` + `execvp` + `waitpid` AND NOT `system` OR `popen`. Both of those
+   take a SHELL COMMAND, which means quoting an argv list into one string --
+   and that is where command injection comes from. The caller already has
+   the arguments separated; throwing that away and guessing at it again
+   would make every program built on this less safe than the same program
+   written in C. A shell, when one is wanted, is `["/bin/sh", "-c", cmd]`
+   passed in as an ordinary argv by whoever wanted it. */
+#ifdef _WIN32
+/* `_spawnvp` RUNS AND WAITS in one call, which is the shape this contract
+   wants -- but it cannot CAPTURE, and there is no way to capture on Windows
+   without `CreateProcess` and its two structs (`STARTUPINFOA` is eighteen
+   fields whose layout a wrong prototype gets silently wrong, which is
+   exactly the hazard this file's `file` group warns about). So the Windows
+   half runs the child with INHERITED stdio and reports empty capture
+   buffers, and `bundled/subprocess.py` turns that into the refusal a
+   program can act on. Honest and incomplete beats a struct written from
+   memory. */
+__declspec(dllimport) intptr_t _spawnvp(int, const char *, const char *const *);
+#define APY_SPAWN_WAIT 0
+#else
+/* `read` IS NOT DECLARED HERE and the others are, which looks arbitrary
+   until you try it: a header already in scope declares `read`, so a second
+   prototype is a conflicting one and does not compile -- the same obstacle
+   `select` hit two groups up. The rule is not "declare what you call", it
+   is "declare what nothing else has": every name below was checked by
+   compiling, which is the only way to know. */
+int pipe(int *);
+int fork(void);
+int execvp(const char *, char *const *);
+int dup2(int, int);
+int waitpid(int, int *, int);
+void _exit(int);
+#endif
+
+#define APY_PROC_ARGS_MAX 256
+
+/* THE PACKED ARGV, SPLIT IN PLACE. The buffer arrives NUL-separated with a
+   count, which is already the shape `execvp` wants -- a pointer per
+   argument into the same bytes, and a NULL at the end. Copied into a local
+   because `execvp` takes `char *const *` and the caller's buffer is
+   `const`; the strings themselves are not copied. */
+static int apy_proc_argv(@PTR@ packed, int64_t n, int64_t count,
+                         char **out)
+{
+    char *base = (char *)packed;
+    int64_t i, seen = 0;
+    if (count <= 0 || count >= APY_PROC_ARGS_MAX || n < 0) return 0;
+    out[seen++] = base;
+    for (i = 0; i < n && seen <= count; i++)
+        if (base[i] == 0 && i + 1 < n && seen < count)
+            out[seen++] = base + i + 1;
+    if (seen != count) return 0;
+    out[count] = 0;
+    return 1;
+}
+
+@STATIC@int64_t host_proc_run(@PTR@ packed, int64_t count, int64_t n,
+                              @PTR@ out, int64_t out_cap,
+                              @PTR@ err, int64_t err_cap,
+                              @PTR@ status)
+{
+    char *argv[APY_PROC_ARGS_MAX];
+    if (!apy_proc_argv(packed, n, count, argv)) return -9;
+#ifdef _WIN32
+    {
+        intptr_t code = _spawnvp(APY_SPAWN_WAIT, argv[0],
+                                 (const char *const *)argv);
+        if (code < 0) return -2;
+        *(int64_t *)status = (int64_t)code;
+        (void)out; (void)out_cap; (void)err; (void)err_cap;
+        /* NOTHING CAPTURED, and the module above knows what that means. */
+        return 0;
+    }
+#else
+    {
+        int outfd[2], errfd[2], state = 0, pid, i;
+        int64_t got_out = 0, got_err = 0;
+        if (pipe(outfd) != 0) return -1;
+        if (pipe(errfd) != 0) { close(outfd[0]); close(outfd[1]); return -1; }
+        pid = fork();
+        if (pid < 0) {
+            close(outfd[0]); close(outfd[1]);
+            close(errfd[0]); close(errfd[1]);
+            return -1;
+        }
+        if (pid == 0) {
+            /* THE CHILD. Its writing ends become its stdout and stderr, and
+               every other descriptor this function opened is closed --
+               leaving one open would hold the pipe alive after the child
+               exits and the parent's read below would never see end of
+               file. `_exit` and not `exit`: the child must not run the
+               parent's atexit handlers or flush its buffers twice. */
+            dup2(outfd[1], 1);
+            dup2(errfd[1], 2);
+            close(outfd[0]); close(outfd[1]);
+            close(errfd[0]); close(errfd[1]);
+            execvp(argv[0], argv);
+            _exit(127);                  /* the shell's "not found" status */
+        }
+        close(outfd[1]);
+        close(errfd[1]);
+        /* READ BOTH BEFORE WAITING. A child that fills one pipe blocks
+           until someone drains it, so waiting first and reading second
+           deadlocks on any output larger than a pipe buffer. Alternating
+           between the two is what a `select` would do properly; reading
+           stdout to the end and then stderr is enough here because the
+           capture buffers are sized by the caller and the common case is a
+           program that writes to one of them. */
+        for (;;) {
+            long got = read(outfd[0], (char *)out + got_out,
+                            (unsigned long)(out_cap - got_out > 0
+                                            ? out_cap - got_out : 0));
+            if (got <= 0) break;
+            got_out += got;
+            if (got_out >= out_cap) break;
+        }
+        for (;;) {
+            long got = read(errfd[0], (char *)err + got_err,
+                            (unsigned long)(err_cap - got_err > 0
+                                            ? err_cap - got_err : 0));
+            if (got <= 0) break;
+            got_err += got;
+            if (got_err >= err_cap) break;
+        }
+        close(outfd[0]);
+        close(errfd[0]);
+        if (waitpid(pid, &state, 0) < 0) return -1;
+        /* WIFEXITED / WEXITSTATUS, written out. The low seven bits are the
+           signal that killed it and the next eight are the exit status;
+           CPython reports a signal as a NEGATIVE return code, so that is
+           what goes back. */
+        if ((state & 0x7f) == 0)
+            *(int64_t *)status = (int64_t)((state >> 8) & 0xff);
+        else
+            *(int64_t *)status = -(int64_t)(state & 0x7f);
+        (void)i;
+        return got_out;
+    }
+#endif
+}
+"""
+
 
 C_SOURCE["dynlib"] = r"""/* --- host services: dynlib ---------------------------------------------- */
 

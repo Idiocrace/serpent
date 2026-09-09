@@ -345,14 +345,88 @@ class Interpreter:
         if fn is None:
             raise Trap(f"no function named {entry!r}")
         try:
-            return self._call(fn, args or [])
+            got = self._call(fn, args or [])
         except _Exited as done:
             # `plat_exit` unwound every frame. The status is RECORDED as well
             # as returned, because a caller cannot otherwise tell it apart
             # from an ordinary `return 7` -- and the two mean different things
             # to whoever is hosting the interpreter. `driver/cli.py` reads it.
             self.exit_status = done.status
+            # SHUTDOWN STILL HAPPENS, because `sys.exit()` is what this is:
+            # CPython raises `SystemExit`, unwinds, and then runs its final
+            # collection exactly as an ordinary return does. (`os._exit()`
+            # is the one that skips it, and nothing lowers to `plat_exit`
+            # for that yet.)
+            self._shutdown()
             return done.status
+        self._shutdown()
+        return got
+
+    def _shutdown(self) -> None:
+        """CPython's FINAL COLLECTION, which is a thing programs print from.
+
+        A `__del__` still pending when the last statement finishes runs at
+        interpreter shutdown there -- `a = Foo()` at module level prints
+        `del a` AFTER the program's own output -- and this used to stop
+        instead, so everything alive at the end silently never finalized.
+        That was the largest of the divergences `docs/STDLIB.md` records,
+        and the only one a program could see just by ending.
+
+        TWO PASSES, and the first one is what gets the ORDER right:
+
+        1. Drop the module's globals, in the order they were BOUND. That
+           is the order CPython's own shutdown clears a module dict in, and
+           it drives every ordinary cascade -- a global list releases its
+           elements, an instance its attributes -- through the same
+           `decref` the rest of the run uses. So `a = Foo("a"); b =
+           Foo("b")` finalizes `a` then `b`, and a `Foo` inside a global
+           list finalizes when that list does.
+
+        2. Finalize whatever is still alive, in the order it was created.
+           This is where a value reachable only through something whose
+           count this scheme deliberately does not cascade from ends up --
+           a closure's captured variable, held by a cell held by a
+           function (see `objects_host._held_by` on why a `Func` is not
+           walked during the run). AND IT IS SAFE ONLY HERE: "finalize it
+           anyway" is exactly the wrong answer while a program is running
+           and exactly the right one when there is no program left to
+           observe the object. CPython's shutdown makes the same trade.
+        """
+        h = self.objects
+        if h is None:
+            return
+        # A POINTER-SIZED GLOBAL HOLDING A LIVE HANDLE, and nothing else.
+        # `module.globals` mixes the program's variables (`gv_x`, eight
+        # bytes, a handle) with its string and bytes literals (`__str0`,
+        # whatever length, raw data), and `Global` records only a size --
+        # there is no flag saying which. Two filters make the question
+        # exact rather than probable: a global narrower than a pointer
+        # cannot hold one (and reading eight bytes from it would read its
+        # NEIGHBOUR's), and a value that is not a key of `_refcount` was
+        # never a handle this scheme minted.
+        #
+        # NOTHING IS WRITTEN BACK. The first version stored 0 over each
+        # slot to keep a second pass from decrefing it twice, and that is
+        # how the literals got destroyed: `__str0` holds the attribute
+        # name `n`, the zero landed on it, and the closure's `__del__`
+        # then failed with `'Foo' object has no attribute '\x00'`. The
+        # store was never needed -- no program code runs after this, and
+        # the sweep below is guarded by `_dead`.
+        sized = {g.name: g.size for g in self.module.globals}
+        for name, addr in sorted(self.globals.items(), key=lambda kv: kv[1]):
+            if sized.get(name, 0) < T.PTR.size:
+                continue
+            value = int(self.mem.read(addr, T.PTR))
+            if value in h._refcount:
+                h.decref(value)
+        # NEWEST HANDLES ARE STILL LOWEST-FIRST: `_refcount` is insertion
+        # ordered and `_new` inserts in creation order, so this walks what
+        # is left oldest-first -- which is the order the remaining objects
+        # were built in and the order CPython's own sweep tends to find
+        # them. `list()` because finalizing cascades and mutates the table.
+        for handle in list(h._refcount):
+            if handle not in h._dead:
+                h._finalize_once(handle)
 
     def _call(self, fn: Function, args: list):
         if fn.external:

@@ -397,11 +397,12 @@ APY_API apy_value apy_import(apy_value name) {
         "_pyrun", "_pyvalidate", "abc", "annotationlib", "asyncio",
         "bisect", "collections", "collections.abc", "contextlib",
         "contextvars", "copy", "dataclasses", "datetime", "decimal",
-        "enum", "fractions", "functools", "gc", "heapq", "inspect", "io",
-        "itertools", "json", "keyword", "math", "numbers", "operator",
-        "os", "pathlib", "random", "re", "statistics", "string", "struct",
-        "sys", "textwrap", "time", "tomllib", "traceback", "types",
-        "typing", "unicodedata", "warnings", "weakref", 0};
+        "enum", "fractions", "functools", "gc", "heapq", "inspect",
+        "io", "itertools", "json", "keyword", "math", "numbers",
+        "operator", "os", "pathlib", "random", "re", "select",
+        "socket", "statistics", "string", "struct", "subprocess",
+        "sys", "textwrap", "threading", "time", "tomllib", "traceback",
+        "types", "typing", "unicodedata", "warnings", "weakref", 0};
     const char *want = O(name)->kind == APY_STR_K ? APY_CSTR(name) : "";
     int i;
     for (i = 0; known[i]; i++)

@@ -104,15 +104,21 @@ from ...objects import hostsvc as _hostsvc  # noqa: E402
 
 #: WHAT THIS BACKEND CAN DO FOR A PROGRAM, beyond the floor. It emits C and
 #: links against a hosted libc, so it has a filesystem, a clock, entropy, an
-#: environment and a dynamic loader. `net` is not here yet and `text` would
-#: need the Unicode table wired to these names -- both are honest absences,
-#: and a program that needs one is refused by `Backend.check_host_services`
+#: environment, a dynamic loader and a network. Only `text` is missing, and
+#: it would need the Unicode table wired to these names -- an honest absence,
+#: and a program that needs it is refused by `Backend.check_host_services`
 #: naming the group.
 #:
 #: `dynlib` IS THE RUN-TIME HALF OF `ctypes`, not a replacement for it: a
 #: literal `CDLL("m")` is still a promise to the linker and still needs
 #: nothing here. See the group's own commentary in `objects/hostsvc.py`.
-_HOSTSVC_GROUPS = frozenset({"file", "time", "random", "env", "dynlib"})
+#:
+#: `net` LINKS AGAINST WINSOCK ON WINDOWS, which is why `_extra_libraries`
+#: below exists: BSD sockets are in libc everywhere else and `ws2_32` is a
+#: separate library there. A group that needs a link input is the first one,
+#: and naming it beside the group is what keeps the two from drifting.
+_HOSTSVC_GROUPS = frozenset({"file", "time", "random", "env", "dynlib",
+                             "net", "proc"})
 
 _HOST_C = _host_functions(static=True, strptr="uintptr_t", ptr="uintptr_t")
 

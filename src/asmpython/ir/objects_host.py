@@ -1024,6 +1024,33 @@ class ObjectHost:
             # there so that a container printing its elements gets it too.
             return repr(v) if quoted else str(v)
         if isinstance(v, Exc):
+            # A CLASS'S OWN `__str__`/`__repr__` WINS, exactly as it does
+            # for an `Instance`. An exception is the one kind of object
+            # whose text is nearly always overridden -- `CalledProcessError`
+            # exists to say "Command 'x' returned non-zero exit status 1"
+            # -- and without this the override was ignored and the ARGS
+            # were printed instead, so every bundled module's exception
+            # said something CPython's did not.
+            #
+            # BEFORE EVERY FIXED RULE BELOW, because those are
+            # BaseException's own and an override is written to replace
+            # them. The runtime's OWN exceptions have no `cls` and skip
+            # this entirely.
+            if v.cls is not None:
+                hook = v.cls.find("__repr__" if quoted else "__str__")
+                if isinstance(hook, (Func, Native)):
+                    try:
+                        # `_invoke_obj` ANSWERS A VALUE, not a handle --
+                        # it ends in `self._get(result, ...)` itself, and
+                        # dereferencing again read the text as a handle
+                        # and tried `int()` on it.
+                        return str(self._invoke_obj(hook.bind(v), []))
+                    except _UserFailed:
+                        # The override failed and the flag is already set.
+                        # Falling through renders what BaseException would,
+                        # which is better than a NULL reaching a caller
+                        # that only wanted some text.
+                        pass
             # MORE THAN ONE ARGUMENT PRINTS AS THE TUPLE. `str(ValueError(
             # 'a','b'))` is `('a', 'b')` and its repr is `ValueError('a',
             # 'b')` -- CPython shows the whole of `args` once there is more
@@ -2925,6 +2952,21 @@ def _apy_seq_push(h, a):
         # `_held_by` releases it when the tuple itself reaches zero.
         h.incref(int(a[1]))
         return h._none
+    if isinstance(seq, bytearray):
+        # A BYTEARRAY APPENDS AN INT, and refuses anything else with the
+        # message CPython uses. It was missing entirely -- `.append` on one
+        # answered "'bytearray' object has no attribute 'append'" about the
+        # most ordinary way there is to build one up, which
+        # `bundled/subprocess.py` found and had to work around. NOT
+        # REFERENCE COUNTED, because an `int` is not a tracked handle: see
+        # `_refcount`'s own comment on why plain scalars are out of scope.
+        if not isinstance(item, int) or isinstance(item, bool):
+            return h._fail("TypeError",
+                           "an integer is required")
+        if not 0 <= item <= 255:
+            return h._fail("ValueError", "byte must be in range(0, 256)")
+        seq.append(item)
+        return h._none
     if not isinstance(seq, list):
         return h._fail(
             "AttributeError",
@@ -3821,9 +3863,10 @@ _KNOWN_MODULES = frozenset({
     "collections", "collections.abc", "contextlib", "contextvars", "copy",
     "dataclasses", "datetime", "decimal", "enum", "fractions", "functools",
     "gc", "heapq", "inspect", "io", "itertools", "json", "keyword", "math",
-    "numbers", "operator", "os", "pathlib", "random", "re", "statistics",
-    "string", "struct", "sys", "textwrap", "time", "tomllib", "traceback",
-    "types", "typing", "unicodedata", "warnings", "weakref",
+    "numbers", "operator", "os", "pathlib", "random", "re", "select",
+    "socket", "statistics", "string", "struct", "subprocess", "sys",
+    "textwrap", "threading", "time", "tomllib", "traceback", "types",
+    "typing", "unicodedata", "warnings", "weakref",
 })
 
 
@@ -7088,8 +7131,21 @@ def _apy_default_getattr(h, a):
         if obj.cls is not None:
             found = obj.cls.find(name)
             if found is not None:
-                return h._new(found.bind(obj)) \
-                    if isinstance(found, (Func, Native)) else h._value(found)
+                if isinstance(found, (Func, Native)):
+                    return h._new(found.bind(obj))
+                # A DESCRIPTOR IS READ THROUGH, exactly as it is on an
+                # `Instance`. Without this a `@property` on an exception
+                # subclass handed the program the `Descr` OBJECT --
+                # `subprocess.CalledProcessError.stdout` printed
+                # `<...objects_host.Descr object at 0x...>` where CPython
+                # prints the output, which is a wrong answer rather than a
+                # missing feature. `classmethod` and `staticmethod` were
+                # wrong the same way.
+                if isinstance(found, Descr) or (
+                        isinstance(found, Instance)
+                        and found.cls.find("__get__") is not None):
+                    return _descr_get(h, found, obj, obj.cls)
+                return h._value(found)
         return h._no_attr(obj, name)
     return h._no_attr(obj, name)
 
@@ -9668,6 +9724,23 @@ def _apy_extend(h, a):
     # push per element, and a starred one extends the same partly-built cell --
     # the C fills a tuple by pushing too, so refusing one here made the two
     # paths disagree on a display the compiled program built happily.
+    if isinstance(seq, bytearray):
+        # BYTES IN, BYTES ON THE END. Same omission as `append` above and
+        # the same finder. A `bytearray` extends from anything byte-like or
+        # from a sequence of ints, which is what CPython accepts.
+        if isinstance(other, (bytes, bytearray, memoryview)):
+            seq.extend(bytes(other))
+            return h._none
+        if isinstance(other, (list, tuple)):
+            for one in other:
+                if not isinstance(one, int) or not 0 <= one <= 255:
+                    return h._fail("ValueError",
+                                   "byte must be in range(0, 256)")
+            seq.extend(bytes(other))
+            return h._none
+        return h._fail("TypeError",
+                       f"can't extend bytearray with "
+                       f"{h.kind_name(other)}")
     if not isinstance(seq, (list, tuple)):
         return h._fail("AttributeError",
                        f"'{h.kind_name(seq)}' object has no attribute 'extend'")

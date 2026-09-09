@@ -55,10 +55,12 @@ UNSUPPORTED = [
     # the splice only scanned MODULE-LEVEL statements, so the identical
     # import one line further in, inside `main`, survived to be denied by
     # `E0083` -- naming `os` in its own "available:" list while doing so.
-    # A module that is genuinely not available (`import socket`) is still
-    # rejected, at either depth, which is what this list is for.
-    "import socket",
-    "from socket import socket",
+    # A module that is genuinely not available (`import hashlib`) is still
+    # rejected, at either depth, which is what this list is for. It was
+    # `socket` until `socket` became one of the bundled modules -- which is
+    # the same staleness this comment is about, one tier up.
+    "import hashlib",
+    "from hashlib import sha256",
     "x = [1, 2, 3]",
     "x = {1: 2}",
     "x = (1, 2)",
