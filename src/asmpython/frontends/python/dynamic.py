@@ -1021,14 +1021,38 @@ class DynamicLowering:
         """
         if not pairs:
             return None
-        symbol = "pyann_" + "".join(c if c.isalnum() or c == "_" else "_"
-                                    for c in key)
+        base = "pyann_" + "".join(c if c.isalnum() or c == "_" else "_"
+                                  for c in key)
         # ONE BODY PER `def`, however many times its value is built. A
         # module-level `def` is pre-bound at program start and rebuilt at its
         # statement, and emitting the thunk both times is two definitions of
-        # one C function.
-        if not any(sym == symbol for sym, _ in self._pending_annotations):
-            self._pending_annotations.append((symbol, pairs))
+        # one C function. The SAME definition reaching here twice hands over
+        # the same annotation nodes, which is what identifies it -- comparing
+        # the AST objects rather than their source text, because two
+        # different classes may spell one annotation the same way.
+        #
+        # TWO DEFINITIONS MAY SHARE A NAME. `class Config: value: int`
+        # followed later by another `class Config` is legal Python: the
+        # second shadows the first, and both have their own annotations. The
+        # key here is the bound name, so both landed on one symbol and the
+        # dedupe kept the FIRST -- so the second class answered the first's
+        # annotations, silently. A numbered suffix separates them; nothing
+        # reads the symbol but the FUNC_ADDR emitted just below.
+        want = [(nm, id(expr)) for nm, expr in pairs]
+        symbol, taken = base, 0
+        while True:
+            had = None
+            for sym, seen in self._pending_annotations:
+                if sym == symbol:
+                    had = seen
+                    break
+            if had is None:
+                self._pending_annotations.append((symbol, pairs))
+                break
+            if [(nm, id(expr)) for nm, expr in had] == want:
+                break
+            taken = taken + 1
+            symbol = base + "__" + str(taken)
         code = self.b.reg(T.PTR)
         self.b.emit(Instruction(Op.FUNC_ADDR, T.PTR, dst=code, sym=symbol))
         return self.b.call(T.PTR, "apy_func_new",
@@ -1864,8 +1888,7 @@ class DynamicLowering:
             # service is.
             return self._dyn_objrt_call(node, node.func.id)
         if (isinstance(node.func, ast.Name) and node.func.id == "dict"
-                and not node.args and node.keywords
-                and "dict" not in self.info.locals):
+                and node.keywords and "dict" not in self.info.locals):
             # `dict(a=1, **other)` IS THE KEYWORD MAPPING, built here.
             #
             # There is no thunk shape for a builtin that takes `**kw`: the
@@ -1874,8 +1897,26 @@ class DynamicLowering:
             # keyword argument`. In SOURCE ORDER, so a later key wins over one
             # a `**` brought -- `dict(**d, k=1)` and `dict(k=1, **d)` are
             # different dicts and CPython keeps the difference.
-            out = self.b.call(T.PTR, "apy_dict_new",
-                              [self.b.const(T.I64, len(node.keywords) + 1)])
+            #
+            # A POSITIONAL ARGUMENT COMES FIRST AND THE KEYWORDS UPDATE IT.
+            # This branch used to require `not node.args`, so
+            # `dict(pairs, **d)` fell through to the value form and reported
+            # the unexpected keyword, and `dict(*args, **kw)` fell through to
+            # the STARRED form, which collects positionals and silently
+            # dropped every keyword -- answering `{}` where CPython answers
+            # the keywords. The positional half is whatever `dict(...)`
+            # without keywords already builds, so it is asked for exactly
+            # that rather than restated here; the result is a fresh dict in
+            # every shape, which is what makes updating it safe.
+            if node.args:
+                bare = ast.copy_location(
+                    ast.Call(func=node.func, args=node.args, keywords=[]),
+                    node)
+                out = self._dyn_call(bare)
+            else:
+                out = self.b.call(
+                    T.PTR, "apy_dict_new",
+                    [self.b.const(T.I64, len(node.keywords) + 1)])
             for kw in node.keywords:
                 if kw.arg is None:
                     self.b.call(T.PTR, "apy_update",
@@ -2063,6 +2104,25 @@ class DynamicLowering:
             # `dict()` is empty; `dict(pairs)` fills from a sequence of pairs.
             out = self.b.call(T.PTR, "apy_dict_new",
                               [self.b.const(T.I64, 1)])
+            if len(node.args) > 1:
+                # A SECOND POSITIONAL IS A TypeError, not something to
+                # ignore. Every argument is still evaluated first, because
+                # CPython evaluates them before the call it then refuses --
+                # and one of them may be the call that does the real work.
+                # RAISED AT RUN TIME rather than reported as a diagnostic:
+                # `dict(a, b)` is a catchable TypeError in CPython and a
+                # program may be testing for exactly that.
+                for one in node.args:
+                    self._dyn_expr(one)
+                self.b.call(T.PTR, "apy_raise",
+                            [self.b.call(
+                                T.PTR, "apy_make_exc",
+                                [self._dyn_str_literal("TypeError"),
+                                 self._dyn_str_literal(
+                                     f"dict expected at most 1 argument, "
+                                     f"got {len(node.args)}")])])
+                self._dyn_check()
+                return out
             if node.args:
                 out = self.b.call(T.PTR, "apy_to_dict",
                                   [self._dyn_expr(node.args[0])])

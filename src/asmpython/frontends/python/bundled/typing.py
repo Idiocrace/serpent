@@ -13,9 +13,10 @@ with `include_extras=False` stripping `Annotated` the way CPython's does;
 `ParamSpec` (with `.args`/`.kwargs`) and `TypeVarTuple`, both real objects
 rather than the inert form the native table had; `dataclass_transform`, PEP
 681's marker, which returns its argument and leaves
-`__dataclass_transform__` on it; `NamedTuple` and `TypedDict`, but ONLY THE
-FUNCTIONAL FORM -- see below for why the class-based form is refused rather
-than silently wrong.
+`__dataclass_transform__` on it; `TypedDict` in BOTH FORMS, class-based and
+functional, with PEP 655's `Required`/`NotRequired` and PEP 705's `ReadOnly`;
+`NamedTuple` in the FUNCTIONAL FORM only -- see below for what separates the
+two.
 
 EVERYTHING ELSE `typing` NAMES -- `Any`, `Union`, `Optional`, `Callable`,
 `Literal`, the container aliases, `Annotated`, `Required` and the rest of
@@ -49,51 +50,65 @@ also survives the splice (`_resolve("typing") is not None` keeps it), which
 is what lets the untouched half of the name -- `typing.Optional` and the
 rest -- keep resolving through the native path exactly as before.
 
-## Why the class-based `NamedTuple`/`TypedDict` form is refused
+## The class body a metaclass cannot see, and what `TypedDict` does about it
 
-CPython builds both from a class body: `class Point(NamedTuple): x: int`
-works because `NamedTupleMeta.__new__` (or, in 3.14, a `__mro_entries__`
-hook) reads `x`'s annotation out of the class namespace it is handed.
-THAT NAMESPACE DOES NOT CARRY IT HERE. A bare annotation with no assigned
-value (`x: int`, as opposed to `y: int = 0`) never enters the `ns` dict a
-custom metaclass's `__new__` receives -- only names the class body actually
-BINDS do. Confirmed by direct probe: a metaclass printing `sorted(ns.keys())`
-for `class Point: x: int; y: int = 0` shows only `['y']`. Reading
-`cls.__annotations__` immediately after `super().__new__()` inside that same
-`__new__` still answers `{}` for BOTH fields -- the PEP 649 thunk that would
-answer `{'x': int, 'y': int}` is wired onto the bound class object by the
-compiler in a step AFTER the whole `class` statement finishes, keyed to the
-name the statement binds; reading it from inside the metaclass call that
-produces that very object is too early, every time. Reading the SAME class's
-`__annotations__` from OUTSIDE the class statement afterwards answers
-correctly -- so the data exists, it is simply invisible to exactly the
-mechanism CPython's own `NamedTuple`/`TypedDict` depend on, and a fix would
-mean changing how the compiler wires PEP 649 thunks into class construction,
-not a change to this module.
+CPython builds both `NamedTuple` and `TypedDict` from a class body:
+`class Point(NamedTuple): x: int` works because `NamedTupleMeta.__new__`
+(or, in 3.14, a `__mro_entries__` hook) reads `x`'s annotation out of the
+class namespace it is handed. THAT NAMESPACE DOES NOT CARRY IT HERE. A bare
+annotation with no assigned value (`x: int`, as opposed to `y: int = 0`)
+never enters the `ns` dict a custom metaclass's `__new__` receives -- only
+names the class body actually BINDS do, which is CPython's behaviour too
+under PEP 649. Reading `cls.__annotations__` immediately after
+`super().__new__()` inside that same `__new__` answers `{}` here where
+CPython answers both fields: the annotation thunk is wired onto the bound
+class object in a step AFTER the whole `class` statement finishes, keyed to
+the name the statement binds, so reading it from inside the metaclass call
+that produces that very object is too early, every time.
 
-A class-based form that happened to work whenever every field carried a
-default -- silently dropping annotation-only ones -- is precisely the
-"accepted and ignored" shape `docs/STDLIB.md` exists to prevent (see its
-`islice`/`frozen=True` examples), so it is refused rather than half-shipped.
-The FUNCTIONAL form needs none of this: `NamedTuple('P', [('x', int)])` and
-`TypedDict('P', {'x': int})` receive their fields as an ordinary argument,
-not by inspecting a class body, and both are fully covered.
+`TypedDict` IS COVERED IN BOTH FORMS ANYWAY, because it does not need the
+fields when the class is made -- only when a program ASKS. Its four key sets
+(`__required_keys__`, `__optional_keys__`, `__readonly_keys__`,
+`__mutable_keys__`) are PROPERTIES ON THE METACLASS, computed from
+`cls.__annotations__` at the moment they are read, which is always after the
+class statement completed. That is the whole trick, and it is why PEP 655's
+`Required`/`NotRequired` and PEP 705's `ReadOnly` work here as well.
+
+ONE THING DOES NOT FOLLOW. `Sub.__annotations__` for a TypedDict inheriting
+from another answers only what `Sub` DECLARED, where CPython answers the
+merge of the whole chain -- CPython's `TypedDict` overwrites the attribute
+during class creation, and here it is answered by the compiler's own thunk,
+which a metaclass property cannot displace (measured: the property is not
+consulted at all). The key sets DO merge, and those are what a program asks
+about inheritance with.
+
+`NamedTuple`'s class form IS STILL REFUSED, and for a reason `TypedDict`'s
+does not share: a namedtuple needs the field ORDER to build its tuple class,
+which is needed AT construction and cannot be deferred to first use. A form
+that happened to work whenever every field carried a default -- silently
+dropping annotation-only ones -- is precisely the "accepted and ignored"
+shape `docs/STDLIB.md` exists to prevent (see its `islice`/`frozen=True`
+examples), so it is refused rather than half-shipped. The FUNCTIONAL form
+needs none of this: `NamedTuple('P', [('x', int)])` receives its fields as an
+ordinary argument.
 
 ## A native-callable `**kwargs`-forwarding gap, found and routed around
 
 `dict(*args, **kwargs)` -- BOTH forwarded together, from inside a function
-that collected them -- silently drops every keyword when `dict` resolves to
-the builtin constructor value: `_apy_call_spread_kw` (`ir/objects_host.py`)
-threads the caller's leftover keywords through as `kwrest` only for a `Func`
-or `Class` callee; `_invoke_obj`'s `Native` branch calls `f.body(*given)`
-and never reads `kwrest` at all. A plain user function forwarding the same
+that collected them -- silently dropped every keyword. THE LITERAL CALL IS
+FIXED: `frontends/python/dynamic.py` now builds the positional half of any
+`dict(...)` and applies the keywords to it, in every shape, which is why
+`_TypedDictMeta.__call__` below can write `dict(*args, **kwargs)` plainly.
+
+WHAT REMAINS is `dict` reached as a VALUE -- `forward(dict, a=1)`, where the
+callee is a parameter. `_apy_call_spread_kw` (`ir/objects_host.py`) threads
+the caller's leftover keywords through as `kwrest` only for a `Func` or
+`Class` callee; `_invoke_obj`'s `Native` branch calls `f.body(*given)` and
+never reads `kwrest` at all. A plain user function forwarding the same
 `*args, **kwargs` to ANOTHER USER FUNCTION is unaffected -- only a builtin
-constructor reached this way loses them. `TypedDict`'s functional-form
-constructor could have hit this (`dict(*args, **kwargs)`), so it is written
-as `dict(**kwargs)` instead -- every real call is keyword-only already, and
-the rewrite needs no compiler change. Not fixed here: nothing in this module
-needs it once routed around, and the fix belongs in `_invoke_obj`'s `Native`
-case for every bundled module, not this one.
+reached this way loses them, and it loses them SILENTLY, which is the part
+worth naming. Nothing in this module needs it, and the fix belongs in
+`_invoke_obj`'s `Native` case for every bundled module rather than here.
 
 ## `get_origin`/`get_args` and a user `Generic[T]` subscript
 
@@ -476,43 +491,166 @@ def NamedTuple(typename, fields):
     return made
 
 
-# ── TypedDict, functional form only ──────────────────────────────────────
+# ── TypedDict, both forms ────────────────────────────────────────────────
+
+#: PEP 655's `Required`/`NotRequired` and PEP 705's `ReadOnly` -- the three
+#: forms that wrap a field's type to say something about the KEY rather than
+#: about the value. Each stays in the native `_TYPING` table; what is read
+#: here is only which one was written.
+_QUALIFIERS = ("Required", "NotRequired", "ReadOnly")
+
+
+def _qualifiers_of(hint):
+    """Which of the three wrap `hint`, outermost first.
+
+    THROUGH THE ATTRIBUTES, not `get_origin`: those are native names this
+    module does not import, and a parameterised type carries `__origin__`
+    and `__args__` either way. `_name` is what a `typing` special form is
+    interned under, so it tells `Required` from `Literal` without naming
+    either.
+
+    THEY NEST. `Required[ReadOnly[int]]` is legal and means both, so this
+    unwraps until it reaches something that is not one of the three.
+    """
+    out = []
+    at = hint
+    while True:
+        origin = getattr(at, "__origin__", None)
+        name = getattr(origin, "_name", None)
+        if name not in _QUALIFIERS:
+            return out
+        out.append(name)
+        args = getattr(at, "__args__", ())
+        if not args:
+            return out
+        at = args[0]
+
+
+def _sorted_into(into, out_of, key):
+    """Put `key` in one list of a pair and take it out of the other.
+
+    A SUBCLASS MAY RE-DECLARE A KEY with a different qualifier -- a base's
+    `NotRequired[str]` becoming a plain `str` makes it required -- so the
+    later declaration has to be able to move it, not merely add it again.
+    """
+    if key in out_of:
+        out_of.remove(key)
+    if key not in into:
+        into.append(key)
+
+
+def _typed_dict_keys(cls):
+    """`(required, optional, readonly, mutable)` for a TypedDict class.
+
+    COMPUTED WHEN ASKED, and that is what makes the class-based form
+    possible here at all. A bare annotation never enters the namespace a
+    metaclass `__new__` receives, and this frontend wires the PEP 649
+    annotation thunk onto the class object only after the whole `class`
+    statement finishes -- so `__new__` cannot see the fields no matter when
+    it looks. Reading them from a PROPERTY ON THE METACLASS defers the
+    question to the first time a program asks it, which is always after the
+    statement completed. The module docstring records the refusal this
+    replaced.
+
+    BASE FIRST, so a subclass's own declaration wins -- and the `total` that
+    decides a key is the one belonging to the class that DECLARED it, which
+    is CPython's rule and the reason this walks the MRO rather than merging
+    the annotations first and asking about `cls` once.
+    """
+    required, optional, readonly, mutable = [], [], [], []
+    for owner in reversed(cls.__mro__):
+        ann = getattr(owner, "__annotations__", None)
+        if not ann:
+            continue
+        total = getattr(owner, "__total__", True)
+        for key in ann:
+            marks = _qualifiers_of(ann[key])
+            if "Required" in marks:
+                wanted = True
+            elif "NotRequired" in marks:
+                wanted = False
+            else:
+                wanted = total
+            if wanted:
+                _sorted_into(required, optional, key)
+            else:
+                _sorted_into(optional, required, key)
+            if "ReadOnly" in marks:
+                _sorted_into(readonly, mutable, key)
+            else:
+                _sorted_into(mutable, readonly, key)
+    return (frozenset(required), frozenset(optional),
+            frozenset(readonly), frozenset(mutable))
+
 
 class _TypedDictMeta(type):
-    def __call__(cls, **kwargs):
-        # `dict(**kwargs)`, DELIBERATELY NOT `dict(*args, **kwargs)` -- see
-        # the module docstring for the native-callable kwargs-forwarding gap
-        # this sidesteps. Every real TypedDict construction is keyword-only
-        # already, so nothing is given up.
-        return dict(**kwargs)
+    """What makes `TypedDict` both a base class and a factory.
+
+    `total` ARRIVES AS A CLASS KEYWORD -- `class C(TypedDict, total=False)`
+    -- which is why `__new__` takes it by name; the functional form puts the
+    same value in the namespace instead, and that one is not overwritten.
+    """
+
+    def __new__(mcls, name, bases, ns, total=True):
+        cls = super().__new__(mcls, name, bases, ns)
+        if "__total__" not in ns:
+            cls.__total__ = total
+        return cls
+
+    def __call__(cls, *args, **kwargs):
+        # `TypedDict(...)` ITSELF IS THE FUNCTIONAL FORM and every other
+        # class built on it BUILDS A DICT. One `__call__` for both, because
+        # `TypedDict` has to be a real class for `class Movie(TypedDict)` to
+        # work and a real callable for `TypedDict("Movie", {...})` to.
+        if cls is TypedDict:
+            return _typed_dict(*args, **kwargs)
+        return dict(*args, **kwargs)
+
+    @property
+    def __required_keys__(cls):
+        return _typed_dict_keys(cls)[0]
+
+    @property
+    def __optional_keys__(cls):
+        return _typed_dict_keys(cls)[1]
+
+    @property
+    def __readonly_keys__(cls):
+        return _typed_dict_keys(cls)[2]
+
+    @property
+    def __mutable_keys__(cls):
+        return _typed_dict_keys(cls)[3]
 
 
-class _TypedDictBase(metaclass=_TypedDictMeta):
-    pass
+class TypedDict(metaclass=_TypedDictMeta):
+    """A dict whose keys are known -- PEP 589, and PEP 655 and 705 with it.
+
+    BOTH FORMS. `class Movie(TypedDict): title: str` and
+    `Movie = TypedDict("Movie", {"title": str})` build the same thing, and
+    calling it returns a PLAIN `dict` -- there is no validation at run time,
+    exactly as in CPython.
+
+    `__annotations__` IS THE CLASS'S OWN, not the merge of its bases'.
+    CPython's `TypedDict` overwrites the attribute with the merged mapping
+    during class creation; this frontend answers it from the PEP 649 thunk
+    the compiler wires on afterwards, which a metaclass cannot displace. So
+    `Sub.__annotations__` has only what `Sub` declared. The four KEY SETS
+    below do merge, because those are computed here rather than stored --
+    and they are what a program asks about inheritance with.
+    """
 
 
-def TypedDict(typename, fields, total=True):
+def _typed_dict(typename, fields, total=True):
     """`Movie = TypedDict("Movie", {"title": str, "year": int})`.
 
-    AT RUN TIME THIS IS A PLAIN `dict`: calling the object this returns
-    builds and returns an ordinary `dict`, exactly as CPython's own
-    `TypedDict` does -- there is no validation, and none is expected.
-
-    `total` DECIDES ALL KEYS AT ONCE -- `Required`/`NotRequired` on an
-    individual field are not consulted (those stay in the native, inert
-    half of `typing`), so every key follows the class's own `total`.
-
-    THE CLASS-BASED FORM IS NOT HERE -- see the module docstring for why.
+    THE SAME OBJECT the class form builds, made by calling the metaclass
+    directly -- the fields go into the namespace as `__annotations__`, which
+    is where a class body's would have ended up, so both forms answer the
+    four key sets through one implementation.
     """
-    required = frozenset(fields) if total else frozenset()
-    optional = frozenset() if total else frozenset(fields)
-    body = {
-        "__annotations__": dict(fields),
-        "__required_keys__": required,
-        "__optional_keys__": optional,
-        "__total__": total,
-    }
-    return _TypedDictMeta(typename, (_TypedDictBase,), body)
+    body = {"__annotations__": dict(fields), "__total__": total}
+    return _TypedDictMeta(typename, (TypedDict,), body)
 
 
 def dataclass_transform(*, eq_default=True, order_default=False,

@@ -219,3 +219,47 @@ class Marked:
 print(Marked.__name__, model.__dataclass_transform__["eq_default"],
       model.__dataclass_transform__["order_default"],
       model.__dataclass_transform__["field_specifiers"])
+
+# ---- TypedDict, both forms ------------------------------------------------
+class Movie(typing.TypedDict):
+    name: str
+    year: int
+
+
+class Config(typing.TypedDict):
+    name: typing.Required[str]
+    debug: typing.NotRequired[bool]
+
+
+class Owned(Config):
+    fixed: typing.ReadOnly[int]
+
+
+class Loose(typing.TypedDict, total=False):
+    x: int
+    y: typing.Required[str]
+
+
+class Nested(typing.TypedDict):
+    k: typing.Required[typing.ReadOnly[int]]
+
+
+Made = typing.TypedDict("Made", {"m": int, "n": typing.NotRequired[str]})
+Partial = typing.TypedDict("Partial", {"p": int}, total=False)
+
+for one in (Movie, Config, Owned, Loose, Nested, Made, Partial):
+    print(one.__name__, one.__total__,
+          sorted(one.__required_keys__), sorted(one.__optional_keys__),
+          sorted(one.__readonly_keys__), sorted(one.__mutable_keys__))
+print(sorted(Movie.__annotations__), sorted(Made.__annotations__))
+print(Movie(name="x", year=2000), type(Movie(name="x")).__name__)
+print(Made(m=1, n="two"), Partial())
+m: Movie = {"name": "x", "year": 2000}
+print(sorted(m.items()), type(m).__name__)
+
+
+def takes(**kw: typing.Unpack[Movie]):
+    return sorted(kw.items())
+
+
+print(takes(name="a", year=1))
