@@ -106,6 +106,31 @@ def compositions(decomp):
     return out
 
 
+def numeric_values():
+    """Every character with a Numeric_Value that `decimal`/`digit` do not
+    already answer -- vulgar fractions (`½` is 0.5), CJK and Roman-adjacent
+    numerals (`〇` is 0, `Ⅷ` is 8), superscripts and subscripts, and so on.
+
+    A SPARSE MAP, not runs: a numeric value is a property of ONE character
+    far more often than of a block, so runs would not compress this the way
+    they compress category or combining class.
+
+    ONLY the characters `ch.isdecimal()` and `ch.isdigit()` are both False
+    for. Those are handled by parsing the character itself (`int(ch)`), so
+    storing them again here would be the same fact twice at the cost of
+    thousands of extra table entries for no character this reaches.
+    """
+    out = []
+    for cp in range(0x110000):
+        ch = chr(cp)
+        if ch.isdecimal() or ch.isdigit():
+            continue
+        v = unicodedata.numeric(ch, None)
+        if v is not None:
+            out.append((cp, v))
+    return out
+
+
 def _wrapped(text: str, width: int = 72) -> str:
     """One long string as adjacent literals, so no line runs off the page."""
     lines = []
@@ -119,6 +144,7 @@ def emit(body: pathlib.Path, into: pathlib.Path) -> str:
     ccc = combining()
     tags, decomp = decompositions()
     comp = compositions(decomp)
+    numeric = numeric_values()
 
     parts = []
     assert len(names) <= len(ALPHABET), "more categories than letters"
@@ -172,6 +198,18 @@ def emit(body: pathlib.Path, into: pathlib.Path) -> str:
     parts.append("_COMPOSE = (")
     parts.append(_wrapped(";".join("%x %x %x" % three for three in comp)))
     parts.append(")")
+    parts.append("")
+    parts.append("#: Numeric value for a character `isdecimal()` and "
+                 "`isdigit()` both miss --")
+    parts.append("#: a vulgar fraction, a CJK or Roman-adjacent numeral. "
+                 "`repr` round-trips")
+    parts.append("#: a float exactly, so parsing this back with `float()` "
+                 "recovers the same")
+    parts.append("#: value the reference implementation reported.")
+    parts.append("_NUMERIC = (")
+    parts.append(_wrapped(";".join(
+        "%x:%r" % (cp, v) for cp, v in numeric)))
+    parts.append(")")
 
     text = body.read_text(encoding="utf-8")
     marker = "# @TABLES@"
@@ -185,7 +223,7 @@ def emit(body: pathlib.Path, into: pathlib.Path) -> str:
     into.write_text(text, encoding="utf-8")
     return (f"{len(cats)} category runs, {len(ccc)} combining runs, "
             f"{len(decomp)} mappings, {len(comp)} compositions, "
-            f"{len(text)} bytes")
+            f"{len(numeric)} extra numeric values, {len(text)} bytes")
 
 
 if __name__ == "__main__":

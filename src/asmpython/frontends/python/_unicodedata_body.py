@@ -22,6 +22,13 @@ not.
 #: anything asks a question about a character.
 _ready = {}
 
+#: NOT `None`. `decimal(ch, None)` is a legitimate call -- CPython's own
+#: signature is `decimal(chr, default=<no value>)`, and `None` is a value
+#: someone can pass on purpose to get it back for a non-digit character
+#: rather than an exception. Testing `default is None` cannot tell "omitted"
+#: from "passed None" apart, so it raised for `decimal(ch, None)` too.
+_MISSING = object()
+
 _SBASE = 0xAC00
 _LBASE = 0x1100
 _VBASE = 0x1161
@@ -73,6 +80,11 @@ def _tables():
         compose[(int(fields[0], 16) << 21) | int(fields[1], 16)] = int(
             fields[2], 16)
     _ready["compose"] = compose
+    numeric = {}
+    for entry in _NUMERIC.split(";"):
+        cp, v = entry.split(":")
+        numeric[int(cp, 16)] = float(v)
+    _ready["numeric"] = numeric
     return _ready
 
 
@@ -277,31 +289,37 @@ def is_normalized(form, text):
     return normalize(form, text) == text
 
 
-def decimal(ch, default=None):
+def decimal(ch, default=_MISSING):
     """The decimal value of a digit character."""
     if ch.isdecimal():
         return int(ch)
-    if default is None:
+    if default is _MISSING:
         raise ValueError("not a decimal")
     return default
 
 
-def digit(ch, default=None):
+def digit(ch, default=_MISSING):
     if ch.isdigit():
         return int(ch)
-    if default is None:
+    if default is _MISSING:
         raise ValueError("not a digit")
     return default
 
 
-def numeric(ch, default=None):
+def numeric(ch, default=_MISSING):
     """The numeric value, which is a FLOAT and may be a fraction -- `½` is
-    0.5 and is neither a digit nor a decimal."""
+    0.5 and is neither a digit nor a decimal, and is answered from
+    `_NUMERIC` -- the table of every character `isdecimal()`/`isdigit()`
+    both miss but that still has a Unicode Numeric_Value (a vulgar
+    fraction, a CJK or Roman-adjacent numeral)."""
     if ch.isdecimal() or ch.isdigit():
         return float(int(ch))
-    if default is None:
-        raise ValueError("not a numeric character")
-    return default
+    v = _tables()["numeric"].get(_one(ch, "numeric"))
+    if v is None:
+        if default is _MISSING:
+            raise ValueError("not a numeric character")
+        return default
+    return v
 
 
 # @TABLES@
