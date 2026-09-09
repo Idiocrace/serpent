@@ -158,4 +158,36 @@ ns = {"__annotate__": my_annotate, "other": 1}
 print(annotationlib.get_annotate_from_class_namespace(ns) is my_annotate)
 print(annotationlib.get_annotate_from_class_namespace({}) is None)
 
+# ---- a forward reference that is NOT a bare identifier ----------------------
+# `eval()` resolves these now, which it could not when this module was
+# written: calling a builtin from inside a bundled module's own body reached
+# lowering unrewritten. See bundled/annotationlib.py.
+class Node:
+    pass
+
+
+where = {"Node": Node}
+print(ForwardRef("Node").evaluate(globals=where) is Node)
+print(ForwardRef("list[int]").evaluate(globals=where))
+print(ForwardRef("int | None").evaluate(globals=where))
+print(ForwardRef("dict[str, list[Node]]").evaluate(globals=where)
+      == dict[str, list[Node]])
+print(ForwardRef("(1, 2, 3)").evaluate(globals=where))
+print(ForwardRef("list[int]").evaluate(format=Format.STRING))
+
+
+def annotated(x: "list[int]", y: "Node", z: "int | None") -> "tuple[int, str]":
+    return (0, "")
+
+
+got = annotationlib.get_annotations(annotated, globals=where, eval_str=True)
+for key in ("x", "z", "return"):
+    print(key, "=", got[key])
+print("y is Node:", got["y"] is Node)
+
+try:
+    ForwardRef("missing[int]").evaluate(globals=where)
+except NameError as exc:
+    print("undefined:", exc)
+
 print("done")

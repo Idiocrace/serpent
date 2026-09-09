@@ -7,8 +7,9 @@
 # on either side; comparisons < <= > >= == != against int/float, including
 # nan/inf; __hash__ agreeing with hash(int) and hash(float) for an equal
 # value; repr (different from str); __abs__, __neg__, __pos__, __bool__,
-# __float__, __int__, __trunc__, __floor__, __ceil__ (called directly --
-# see bundled/fractions.py's docstring for why not through math.floor/ceil);
+# __float__, __int__, __trunc__, __floor__, __ceil__ (called directly AND
+# through math.floor/ceil/trunc, which consult them since this module found
+# that they did not -- see bundled/fractions.py's docstring);
 # __round__ with half-to-even and ndigits=. NOT covered: numbers.Rational
 # interop, complex, __format__, Decimal interop, pickling.
 #

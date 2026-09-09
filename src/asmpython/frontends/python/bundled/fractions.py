@@ -28,22 +28,17 @@ pickling hooks (`__reduce__`) or `__copy__`/`__deepcopy__` -- an ordinary
 attribute-for-attribute copy already gets the right answer for an immutable
 value with no cycle to break.
 
-`math.floor(x)`, `math.ceil(x)` AND `math.trunc(x)` DO NOT CONSULT
-`__floor__`/`__ceil__`/`__trunc__` FOR A GENERAL OBJECT, unlike CPython's.
-Checked directly against a minimal class defining all three: `round(x)`,
-`abs(x)`, `-x`, `+x` and `int(x)` all reach the user's dunder, and
-`math.floor(x)` answers `TypeError: must be real number, not <kind>` for the
-exact same object. `apy_math_floor`/`_ceil`/`_trunc` -- both the C
-(`objects/c/_math.py`) and the interpreter's own copy
-(`ir/objects_host.py:_math_real`) -- accept only `int`/`float`/`bool` and
-never ask the object anything, where `sorted`/`min`/`max`/`abs`/`round`
-already learned to fall back to a user's dunder. So `Fraction.__floor__` and
-`.__ceil__` are real, correct, and reached by calling them directly
-(`f.__floor__()`) or through `int(f)`/`math.trunc`'s WORKING sibling
-`__trunc__` reached via `int()` -- just not through `math.floor(f)` or
-`math.ceil(f)` themselves. Left refused rather than patched: the fix belongs
-to `math`'s three functions, used by every future module that wants them on
-an object of its own, not to this one.
+`math.floor(f)`, `math.ceil(f)` AND `math.trunc(f)` NOW WORK, and this
+module is why they do. They used to accept only `int`/`float`/`bool` and
+never ask the object anything -- so `round(x)`, `abs(x)`, `-x`, `+x` and
+`int(x)` all reached a user's dunder while `math.floor(x)` answered
+`TypeError: must be real number, not <kind>` for the exact same object, and
+the only rounding a `Fraction` could get was by calling `f.__floor__()`
+directly. Writing this module is what found it; the fix went where it
+belonged, to `math`'s three functions (`objects/c/_math.py`,
+`runtime/mathints.py` and `ir/objects_host.py`'s `_math1`), so every module
+with a real number of its own gets it. `bundled/decimal.py` gained
+`__floor__`/`__ceil__` at the same time and for the same reason.
 
 `math.gcd` IS used, and safely: the reduction below and every arithmetic
 operator lean on it rather than a hand-written Euclidean algorithm.

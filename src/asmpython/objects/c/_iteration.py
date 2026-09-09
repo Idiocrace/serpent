@@ -334,6 +334,22 @@ static int64_t apy_hash_raw(apy_value v) {
         for (i = 0; i < O(v)->v.q.n; i++)
             h ^= apy_hash_raw(O(v)->v.q.items[i]) * (int64_t)0x9e3779b97f4a7c15ULL;
         return h ^ O(v)->v.q.n;
+    case APY_ALIAS_K:
+        /* EQUAL ALIASES HASH EQUALLY, which is the whole point of hooking a
+           kind here rather than leaving it to the address below. The ORIGIN
+           hashes by address because that is what `apy_eq_raw` compares it
+           by, and a UNION'S ARMS are combined order-free so `int | str` and
+           `str | int` land in one bucket the way they compare equal. */
+        h = (int64_t)O(v)->v.ga.origin;
+        if (apy_is_union(v)) {
+            apy_value args = O(v)->v.ga.args;
+            for (i = 0; i < O(args)->v.q.n; i++)
+                h ^= (int64_t)O(args)->v.q.items[i]
+                     * (int64_t)0x9e3779b97f4a7c15ULL;
+            return h;
+        }
+        return (int64_t)((uint64_t)h * 1000003ULL)
+               ^ apy_hash_raw(O(v)->v.ga.args);
     case APY_INST_K: {
         /* The class decides. `__hash__` returns an int, and returning
            anything else is the class's error, not something to paper over. */

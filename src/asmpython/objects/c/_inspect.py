@@ -212,7 +212,7 @@ static const char *apy_kind_name(apy_value v) {
            is built on the `Union` form, and `type(...).__name__` is how a
            program tells the two apart. */
         return O(O(v)->v.ga.origin)->kind == APY_INST_K
-            ? "Union" : "types.GenericAlias";
+            ? "typing.Union" : "types.GenericAlias";
     case APY_MVIEW_K: return "memoryview";
     case APY_RANGE_K: return "range";
     case APY_VIEW_K:
@@ -234,6 +234,31 @@ static const char *apy_kind_name(apy_value v) {
     }
 }
 
+APY_API apy_value apy_str_slice_of(apy_value s, int64_t lo, int64_t hi);
+
+/* A type's `__name__` is the LAST COMPONENT of its dotted name.
+
+   Two kinds here are named the way CPython names them in a message --
+   `types.GenericAlias` and `typing.Union` -- because that is what
+   `unsupported operand type(s) for +` prints and what `<class '...'>` shows.
+   `__name__` is the other half of the same rule: CPython answers
+   `GenericAlias` and `Union`, keeping the module in `__module__` and never in
+   the name. One dotted string serves both, split here.
+
+   THE SAME VALUE COMES BACK when there is no dot, which is what keeps
+   `type(a).__name__ is type(b).__name__` true for two instances of one class.
+   No identifier can hold a dot, so a class the program wrote never takes the
+   slicing branch -- and one whose `__name__` was ASSIGNED a dotted string is
+   sliced safely rather than read past its end, which is why the scan is
+   bounded by the length rather than looking for a NUL. */
+static apy_value apy_bare_name(apy_value name) {
+    int64_t i;
+    for (i = O(name)->v.s.n - 1; i >= 0; i--)
+        if (O(name)->v.s.p[i] == '.')
+            return apy_str_slice_of(name, i + 1, O(name)->v.s.n);
+    return name;
+}
+
 APY_API apy_value apy_type_name(apy_value v) {
     /* The class's own name value, not a fresh copy: `type(a).__name__ is
        type(b).__name__` for two instances of one class, as in CPython. */
@@ -242,7 +267,12 @@ APY_API apy_value apy_type_name(apy_value v) {
        An ordinary class has no metaclass recorded and is a `type`. */
     if (O(v)->kind == APY_TYPE_K)
         return O(v)->v.t.meta ? O(O(v)->v.t.meta)->v.t.name : apy_lit("type");
-    return apy_lit(apy_kind_name(v));
+    {
+        /* The kind name is a static literal, so the tail of a dotted one is
+           a NUL-terminated string of its own and needs no copy. */
+        const char *nm = apy_kind_name(v), *dot = strrchr(nm, '.');
+        return apy_lit(dot ? dot + 1 : nm);
+    }
 }
 
 APY_API int64_t apy_truth(apy_value v) {

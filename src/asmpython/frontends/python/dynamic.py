@@ -3894,10 +3894,31 @@ class DynamicLowering:
                         [func, self.b.const(T.I64, i),
                          self._dyn_str_literal(param)])
         for i, value in enumerate(defaults):
+            # THE DEFAULT KEEPS ITS OWN TYPE. Every one of these was emitted
+            # through `apy_from_float`, which was invisible while the only
+            # defaults in the table were `math.isclose`'s two tolerances --
+            # both floats. `math.prod`'s `start=1` is an INT, and it decides
+            # the type of the whole product: `prod([1, 2, 3, 4])` answered
+            # 24.0 where CPython answers 24, because the accumulator started
+            # as a float.
+            if value is None:
+                # `None` IS A DEFAULT LIKE ANY OTHER, and the one shape
+                # that has no `const` at all -- `math.log`'s `base` uses it
+                # as the sentinel meaning "the natural log", because
+                # computing `log(x) / log(e)` is not bit-identical to
+                # `log(x)`.
+                made = self.b.call(T.PTR, "apy_none", [])
+            elif isinstance(value, bool):
+                made = self.b.call(T.PTR, "apy_from_bool",
+                                   [self.b.const(T.I64, int(value))])
+            elif isinstance(value, int):
+                made = self.b.call(T.PTR, "apy_from_int",
+                                   [self.b.const(T.I64, value)])
+            else:
+                made = self.b.call(T.PTR, "apy_from_float",
+                                   [self.b.const(T.F64, value)])
             self.b.call(T.PTR, "apy_func_default",
-                        [func, self.b.const(T.I64, i),
-                         self.b.call(T.PTR, "apy_from_float",
-                                     [self.b.const(T.F64, value)])])
+                        [func, self.b.const(T.I64, i), made])
         return func
 
     def _dyn_intrinsic_value(self, name: str, symbol: str, params, ret) -> int:

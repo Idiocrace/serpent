@@ -226,11 +226,16 @@ APY_API apy_value apy_default_getattr(apy_value obj, apy_value name) {
     }
     case APY_TYPE_K: {
         apy_value found;
-        if (strcmp(want, "__name__") == 0) return O(obj)->v.t.name;
+        /* THE BARE NAME: a builtin kind is stored under the dotted spelling
+           CPython puts in a message and in `<class '...'>`, and `__name__` is
+           the last component of it. See `apy_bare_name`. */
+        if (strcmp(want, "__name__") == 0)
+            return apy_bare_name(O(obj)->v.t.name);
         /* PEP 3155. A class nested in another would qualify differently; only
            the top-level spelling is recorded, which is the same limit the
            frontend's own keys have for classes. */
-        if (strcmp(want, "__qualname__") == 0) return O(obj)->v.t.name;
+        if (strcmp(want, "__qualname__") == 0)
+            return apy_bare_name(O(obj)->v.t.name);
         /* PEP 649 for a CLASS: `C.__annotations__` is built on access by the
            thunk the body left in the dict, for the same reason a function's
            is -- an annotation may name something that does not exist yet. */

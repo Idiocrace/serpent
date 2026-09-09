@@ -261,7 +261,7 @@ def apy_kind_name_of(v: ptr) -> ptr:
         # program tells the two apart.
         if i64(load(i32, offset(ptr(load(u64, offset(
                 v, apy_ga_origin_offset()))), 0))) == apy_inst_kind():
-            return rodata(b"Union\0")
+            return rodata(b"typing.Union\0")
         return rodata(b"types.GenericAlias\0")
     # THE C'S `default` IS `str` AND NOT A REFUSAL, which looks arbitrary and
     # is load-bearing: several cells that never reach a message share the str
@@ -325,4 +325,18 @@ def apy_type_name(v: ptr) -> ptr:
         if meta:
             return ptr(load(u64, offset(meta, apy_t_name_offset())))
         return apy_from_cstr(rodata(b"type\0"))
-    return apy_from_cstr(apy_kind_name_of(v))
+    # THE BARE NAME. A builtin kind is named the way CPython names it in a
+    # message -- `types.GenericAlias`, `typing.Union` -- and `__name__` is the
+    # last component of that, with the module belonging in `__module__`. The
+    # kind name is a static literal, so the tail of a dotted one is a
+    # NUL-terminated string of its own and needs no copy.
+    nm: ptr = apy_kind_name_of(v)
+    i: i64 = 0
+    at: i64 = -1
+    while load(u8, offset(nm, i)):
+        if i64(load(u8, offset(nm, i))) == 46:
+            at = i
+        i = i + 1
+    if at >= 0:
+        return apy_from_cstr(offset(nm, at + 1))
+    return apy_from_cstr(nm)

@@ -18,22 +18,66 @@ def apy_int_not(v: ptr) -> ptr:
                b"integer\0"))
 
 
-def apy_math_gcd(a: ptr, b: ptr) -> ptr:
-    """`math.gcd(a, b)` by Euclid.
+def apy_math_abs_int(v: ptr) -> ptr:
+    """`abs(v)` for an int or a big.
 
-    BOTH SIGNS ARE DROPPED FIRST, because a gcd is never negative and `%` in
-    C keeps the sign of its left operand -- so `gcd(-12, 8)` would answer -4
+    NOT `apy_abs`, which is the obvious call and is not one of the SPLIT
+    functions: a ported module reaching for it would be a dependency on the C
+    that nobody declared, which is exactly what
+    `tests/asmpython/integration/test_ported_int.py` exists to catch --
+    "the allocator asks the floor and nothing else". `apy_lt` and `apy_neg`
+    ARE split, and between them they are the whole of what abs means for an
+    integer, big or not.
+
+    THE FAILURE CHECK IS NOT DECORATION. `apy_lt` answers 0 for a comparison
+    it could not make, and `apy_truth(0)` would read a null.
+    """
+    less: ptr = apy_lt(v, apy_from_int(0))
+    if not less:
+        return less
+    if apy_truth(less):
+        return apy_neg(v)
+    return v
+
+
+def apy_math_gcd(a: ptr, b: ptr) -> ptr:
+    """`math.gcd(a, b)` by Euclid, for integers of any size.
+
+    BOTH SIGNS ARE DROPPED FIRST, because a gcd is never negative and `%`
+    keeps the sign of its left operand -- so `gcd(-12, 8)` would answer -4
     without this.
 
-    A BIG IS ACCEPTED BY THE CHECK AND READ AS A MACHINE WORD, which is the
-    C's behaviour and is wrong for a big: `v.i` on one is a pointer. It is
-    left alone deliberately -- correcting it here would make the two
-    arrangements disagree, and the fix belongs with the big integers.
+    TWO LOOPS, AND THE SECOND ONE IS THE FIX. This read `v.i` off both
+    arguments and ran Euclid in machine words, which is a POINTER read as
+    an integer when the argument is a big: `gcd(2**100, 2**60)` answered 8.
+    The docstring said so and left it, on the grounds that "the fix belongs
+    with the big integers" -- and it does, which is why it is here now that
+    `bigmake.py` can make one.
+
+    THE FAST PATH IS KEPT because it is most calls and it is much faster: a
+    machine-word remainder is one instruction where `apy_mod` allocates a
+    value per step. It runs only when NEITHER argument is a big, and the
+    general loop below runs otherwise -- through `apy_math_abs_int`,
+    `apy_mod` and `apy_truth`, each of which already knows what a big is.
     """
     if not apy_is_int_like_of(a):
         return apy_int_not(a)
     if not apy_is_int_like_of(b):
         return apy_int_not(b)
+    if apy_is_big_of(a) or apy_is_big_of(b):
+        u: ptr = apy_math_abs_int(a)
+        if not u:
+            return u
+        v: ptr = apy_math_abs_int(b)
+        if not v:
+            return v
+        while apy_truth(v):
+            r: ptr = apy_mod(u, v)
+            if not r:
+                return r
+            u = v
+            v = r
+        return u
     x: i64 = apy_int_payload(a)
     y: i64 = apy_int_payload(b)
     if x < 0:
@@ -116,6 +160,91 @@ def apy_view_items(v: ptr) -> ptr:
     return out
 
 
+def apy_math_perm(n: ptr, k: ptr) -> ptr:
+    """`math.perm(n, k)` -- the ordered arrangements of `k` from `n`.
+
+    THE FALLING FACTORIAL, computed directly rather than as
+    `factorial(n) // factorial(n - k)`: `perm(1000, 2)` is 999000 and the
+    quotient form would build a 2568-digit number to answer it.
+
+    THROUGH THE ORDINARY MULTIPLY, so a result past int64 promotes to a big
+    the way `2 ** 100` does -- `perm(25, 25)` has 84 bits.
+    """
+    if not apy_is_int_like_of(n):
+        return apy_int_not(n)
+    if not apy_is_int_like_of(k):
+        return apy_int_not(k)
+    top: i64 = apy_int_payload(n)
+    want: i64 = apy_int_payload(k)
+    if apy_is_big_of(n) or apy_is_big_of(k):
+        # A COUNT THAT DOES NOT FIT A MACHINE WORD is a loop that would
+        # never finish, so it is refused rather than started. CPython
+        # answers it, eventually; nothing that could reach here would wait.
+        return apy_raise_at(
+            rodata(b"OverflowError\0"),
+            rodata(b"comb()/perm() arguments must fit in a machine "
+                   b"word here\0"))
+    if top < 0 or want < 0:
+        return apy_raise_at(
+            rodata(b"ValueError\0"),
+            rodata(b"perm() arguments must be non-negative\0"))
+    if want > top:
+        return apy_from_int(0)
+    acc: ptr = apy_from_int(1)
+    i: i64 = 0
+    while i < want:
+        acc = apy_mul(acc, apy_from_int(top - i))
+        if not acc:
+            return acc
+        i = i + 1
+    return acc
+
+
+def apy_math_comb(n: ptr, k: ptr) -> ptr:
+    """`math.comb(n, k)` -- the unordered choices of `k` from `n`.
+
+    DIVIDING AS IT GOES, `acc = acc * (n - i) // (i + 1)`, which is exact at
+    every step because the product of any `i + 1` consecutive integers is
+    divisible by `(i + 1)!`. Multiplying the whole numerator first and
+    dividing once would build a number far larger than the answer --
+    `comb(1000, 500)` would need the 2568-digit `1000!` to produce a
+    300-digit result.
+
+    `k` IS MIRRORED to the smaller half, since `comb(n, k) == comb(n,
+    n - k)`: `comb(1000, 999)` is 1000 loops or one.
+    """
+    if not apy_is_int_like_of(n):
+        return apy_int_not(n)
+    if not apy_is_int_like_of(k):
+        return apy_int_not(k)
+    if apy_is_big_of(n) or apy_is_big_of(k):
+        return apy_raise_at(
+            rodata(b"OverflowError\0"),
+            rodata(b"comb()/perm() arguments must fit in a machine "
+                   b"word here\0"))
+    top: i64 = apy_int_payload(n)
+    want: i64 = apy_int_payload(k)
+    if top < 0 or want < 0:
+        return apy_raise_at(
+            rodata(b"ValueError\0"),
+            rodata(b"comb() arguments must be non-negative\0"))
+    if want > top:
+        return apy_from_int(0)
+    if want > top - want:
+        want = top - want
+    acc: ptr = apy_from_int(1)
+    i: i64 = 0
+    while i < want:
+        acc = apy_mul(acc, apy_from_int(top - i))
+        if not acc:
+            return acc
+        acc = apy_floordiv(acc, apy_from_int(i + 1))
+        if not acc:
+            return acc
+        i = i + 1
+    return acc
+
+
 def apy_math_lcm(a: ptr, b: ptr) -> ptr:
     """`math.lcm(a, b)`.
 
@@ -130,13 +259,28 @@ def apy_math_lcm(a: ptr, b: ptr) -> ptr:
     THE TYPE CHECK IS `apy_math_gcd`'s, reached by calling it -- so a
     non-integer gets the same message from both, which is what a program
     comparing them would expect.
+
+    A BIG TAKES THE SAME ROUTE `apy_math_gcd` does, and for the same
+    reason: reading `v.i` off one reads a pointer, so `lcm(10**29, 30)`
+    answered a number with fifteen digits instead of thirty.
     """
     g: ptr = apy_math_gcd(a, b)
     if not g:
         return g
-    d: i64 = apy_int_payload(g)
-    if d == 0:
+    if not apy_truth(g):
         return apy_from_int(0)
+    if apy_is_big_of(a) or apy_is_big_of(b) or apy_is_big_of(g):
+        u: ptr = apy_math_abs_int(a)
+        if not u:
+            return u
+        v: ptr = apy_math_abs_int(b)
+        if not v:
+            return v
+        q: ptr = apy_floordiv(u, g)
+        if not q:
+            return q
+        return apy_mul(q, v)
+    d: i64 = apy_int_payload(g)
     x: i64 = apy_int_payload(a)
     y: i64 = apy_int_payload(b)
     if x < 0:

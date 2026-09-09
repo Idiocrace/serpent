@@ -916,6 +916,16 @@ static int apy_is_type_like(apy_value v) {
         && O(O(v)->v.ga.origin)->kind == APY_INST_K;
 }
 
+/* `int | str | int` HAS TWO ARMS. CPython drops a repeat when it builds the
+   union, so the repr shows each arm once; keeping it printed
+   `int | str | int` where CPython prints `int | str`. */
+static void apy_union_arm(apy_value into, apy_value v) {
+    int64_t i;
+    for (i = 0; i < O(into)->v.q.n; i++)
+        if (O(into)->v.q.items[i] == v) return;
+    apy_seq_push(into, v);
+}
+
 /* Append `v`'s arms to `into`. A union contributes its own arms rather than
    itself, so unions flatten instead of nesting. */
 static void apy_union_arms(apy_value into, apy_value v) {
@@ -923,15 +933,48 @@ static void apy_union_arms(apy_value into, apy_value v) {
             && O(O(v)->v.ga.origin)->kind == APY_INST_K) {
         int64_t i;
         for (i = 0; i < O(O(v)->v.ga.args)->v.q.n; i++)
-            apy_seq_push(into, O(O(v)->v.ga.args)->v.q.items[i]);
+            apy_union_arm(into, O(O(v)->v.ga.args)->v.q.items[i]);
         return;
     }
     /* `None` IN A UNION IS `NoneType`. `int | None` is written with the
        VALUE and holds the TYPE -- `get_args` answers `<class 'NoneType'>` in
        CPython, and pushing the singleton answered `None`, which is a
        different object with a different repr. */
-    if (O(v)->kind == APY_NONE_K) { apy_seq_push(into, apy_kind_class(v)); return; }
-    apy_seq_push(into, v);
+    if (O(v)->kind == APY_NONE_K) { apy_union_arm(into, apy_kind_class(v)); return; }
+    apy_union_arm(into, v);
+}
+
+
+/* Is this a UNION -- `int | str` -- rather than some other parameterised
+   form? `apy_is_type_like` above accepts any INST_K origin, which every
+   `typing` special form has, and that is too loose here: only a union's arms
+   are order-free. `tuple[int, str]` and `tuple[str, int]` are different
+   types, and so are `Callable[[int], str]` and `Callable[[str], int]`. */
+static int apy_is_union(apy_value v) {
+    return O(v)->kind == APY_ALIAS_K
+        && O(v)->v.ga.origin == apy_typing_form(apy_lit("Union"));
+}
+
+/* Do two unions have the SAME ARMS, in any order and however often each is
+   written? `int | str` equals `str | int`, and `int | str | int` equals
+   `int | str`. Containment both ways says exactly that.
+
+   ARMS ARE COMPARED BY ADDRESS, which is what a union holds: a type object,
+   interned once. Asking `apy_eq_raw` instead would run a user `__eq__` for
+   an arm that is an instance, from inside the equality this is part of. */
+static int apy_arms_match(apy_value a, apy_value b) {
+    int64_t i, j;
+    for (i = 0; i < O(a)->v.q.n; i++) {
+        for (j = 0; j < O(b)->v.q.n; j++)
+            if (O(a)->v.q.items[i] == O(b)->v.q.items[j]) break;
+        if (j == O(b)->v.q.n) return 0;
+    }
+    for (i = 0; i < O(b)->v.q.n; i++) {
+        for (j = 0; j < O(a)->v.q.n; j++)
+            if (O(b)->v.q.items[i] == O(a)->v.q.items[j]) break;
+        if (j == O(a)->v.q.n) return 0;
+    }
+    return 1;
 }
 
 APY_API apy_value apy_bitor(apy_value a, apy_value b) {
@@ -1193,6 +1236,19 @@ static int apy_eq_raw(apy_value a, apy_value b) {
         return O(a)->kind == O(b)->kind && apy_str_cmp(a, b) == 0;
     if (O(a)->kind == APY_NONE_K || O(b)->kind == APY_NONE_K)
         return O(a)->kind == O(b)->kind;
+    /* `list[int] == list[int]` -- SAME ORIGIN, SAME ARGUMENTS. Two spellings
+       of one annotation are one type in CPython; the identity fallthrough
+       below made them distinct, and `apy_hash_raw` agreed with it, so a set
+       of aliases kept every duplicate and a dict keyed on one never found it
+       again. A UNION'S ARMS ARE ORDER-FREE -- `int | str` is `str | int` --
+       and nothing else's are, which is what `apy_is_union` is narrow for. */
+    if (O(a)->kind == APY_ALIAS_K || O(b)->kind == APY_ALIAS_K) {
+        if (O(a)->kind != O(b)->kind) return 0;
+        if (O(a)->v.ga.origin != O(b)->v.ga.origin) return 0;
+        if (apy_is_union(a))
+            return apy_arms_match(O(a)->v.ga.args, O(b)->v.ga.args);
+        return apy_eq_raw(O(a)->v.ga.args, O(b)->v.ga.args);
+    }
     /* `slice(1, 2) == slice(1, 3)` is False: a slice compares by its three
        BOUNDS, which is the only thing it holds. */
     if (O(a)->kind == APY_SLICE_K || O(b)->kind == APY_SLICE_K)

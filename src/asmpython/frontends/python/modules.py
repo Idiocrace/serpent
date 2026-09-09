@@ -59,7 +59,10 @@ _MATH = {
     "isqrt": ("call", "apy_math_isqrt", 1),
     "factorial": ("call", "apy_math_factorial", 1),
     "exp": ("call", "apy_math_exp", 1),
-    "log": ("call", "apy_math_log", 1),
+    # `log(x)` and `log(x, base)`. The base defaults to None rather
+    # than to `e`, so the one-argument form reaches `log()` itself:
+    # computing it as `log(x) / log(e)` differs in the last place.
+    "log": ("call", "apy_math_log", 2, ("x", "base"), (None,)),
     "log2": ("call", "apy_math_log2", 1),
     "log10": ("call", "apy_math_log10", 1),
     "sin": ("call", "apy_math_sin", 1),
@@ -68,8 +71,49 @@ _MATH = {
     "atan": ("call", "apy_math_atan", 1),
     "degrees": ("call", "apy_math_degrees", 1),
     "radians": ("call", "apy_math_radians", 1),
+    # THE REST OF libm, and the three sequence functions. Every name
+    # here was simply ABSENT -- `math.acos` was an AttributeError and
+    # `math.fsum` was the reason a program could not add floats
+    # exactly. `frexp` and `modf` answer a PAIR; `dist` takes two
+    # sequences and `fsum`/`prod` one.
+    "acos": ("call", "apy_math_acos", 1),
+    "asin": ("call", "apy_math_asin", 1),
+    "acosh": ("call", "apy_math_acosh", 1),
+    "asinh": ("call", "apy_math_asinh", 1),
+    "atanh": ("call", "apy_math_atanh", 1),
+    "cosh": ("call", "apy_math_cosh", 1),
+    "sinh": ("call", "apy_math_sinh", 1),
+    "tanh": ("call", "apy_math_tanh", 1),
+    "expm1": ("call", "apy_math_expm1", 1),
+    "log1p": ("call", "apy_math_log1p", 1),
+    "erf": ("call", "apy_math_erf", 1),
+    "erfc": ("call", "apy_math_erfc", 1),
+    "gamma": ("call", "apy_math_gamma", 1),
+    "lgamma": ("call", "apy_math_lgamma", 1),
+    "cbrt": ("call", "apy_math_cbrt", 1),
+    "exp2": ("call", "apy_math_exp2", 1),
+    "ulp": ("call", "apy_math_ulp", 1),
+    "frexp": ("call", "apy_math_frexp", 1),
+    "modf": ("call", "apy_math_modf", 1),
+    "fmod": ("call", "apy_math_fmod", 2),
+    "remainder": ("call", "apy_math_remainder", 2),
+    "nextafter": ("call", "apy_math_nextafter", 2),
+    "ldexp": ("call", "apy_math_ldexp", 2),
+    "dist": ("call", "apy_math_dist", 2),
+    "fsum": ("call", "apy_math_fsum", 1),
+    "sumprod": ("call", "apy_math_sumprod", 2),
+    "fma": ("call", "apy_math_fma", 3),
+    # `start` IS KEYWORD-ONLY in CPython and defaults to the int 1,
+    # which is what makes `prod([])` an int rather than a float.
+    "prod": ("call", "apy_math_prod", 2, ("iterable", "start"),
+             (1,)),
     "gcd": ("call", "apy_math_gcd", 2),
     "lcm": ("call", "apy_math_lcm", 2),
+    # `comb` AND `perm` OVER THE FACTORIALS, and both grow past a machine
+    # word almost immediately -- `comb(60, 30)` has 59 bits and
+    # `perm(25, 25)` has 84 -- so both go through the big integers.
+    "comb": ("call", "apy_math_comb", 2),
+    "perm": ("call", "apy_math_perm", 2),
     "copysign": ("call", "apy_math_copysign", 2),
     "pow": ("call", "apy_math_pow", 2),
     "atan2": ("call", "apy_math_atan2", 2),

@@ -78,6 +78,11 @@ APY_API apy_value apy_unhashable_of(apy_value v) {
             if (bad) return bad;
         }
     }
+    /* AN ALIAS IS AS HASHABLE AS ITS ARGUMENTS, for the same reason a tuple
+       is: `apy_hash_raw` combines them, so `list[[]]` would otherwise be
+       hashed through a list -- by address, silently, where CPython raises
+       `unhashable type: 'list'`. */
+    if (O(v)->kind == APY_ALIAS_K) return apy_unhashable_of(O(v)->v.ga.args);
     /* A USER OBJECT WHOSE CLASS DEFINES `__eq__` AND NOT `__hash__` is
        unhashable, and this is where a CONTAINER finds that out. `hash(x)`
        already refused it, but `{x: 1}` and `{x}` went through here, found

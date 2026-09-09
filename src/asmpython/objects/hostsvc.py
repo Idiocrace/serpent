@@ -973,6 +973,11 @@ int execvp(const char *, char *const *);
 int dup2(int, int);
 int waitpid(int, int *, int);
 void _exit(int);
+/* DECLARED HERE TOO, though `net` declares it as well: a group must not
+   depend on another group being emitted, because a backend may take one
+   and not the other. Two identical prototypes for one symbol are legal C;
+   two DIFFERENT ones are not, which is why both say `int close(int)`. */
+int close(int);
 #endif
 
 #define APY_PROC_ARGS_MAX 256
@@ -1187,8 +1192,19 @@ def c_source(groups, *, static: bool = False, ptr: str = "void *") -> str:
     declare a capability it implements ITSELF -- the JVM backend will answer
     `file` from `java.nio` and wants no C at all. This function answers "what
     C do you need from me", and for such a backend the answer is none.
+
+    IN `GROUPS` ORDER, NOT THE CALLER'S. A backend declares its set as a
+    `frozenset`, whose iteration order is a hash artefact -- so the emitted
+    C came out in a different order on different runs, and a group whose
+    prototypes another one relies on landed after it about half the time.
+    That is exactly what happened: `proc` calls `close`, which `net`
+    declares, and the build failed with an implicit declaration whenever
+    the set happened to yield `proc` first. Ordering here is one line; each
+    group ALSO declaring what it calls is the other half of the fix, and
+    both are needed -- this makes the output reproducible and that makes
+    each group independent.
     """
-    parts = [C_SOURCE[g] for g in groups if g in C_SOURCE]
+    parts = [C_SOURCE[g] for g in GROUPS if g in groups and g in C_SOURCE]
     text = "\n".join(parts)
     return (text.replace("@PTR@", ptr)
                 .replace("@STATIC@", "static " if static else ""))

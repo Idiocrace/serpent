@@ -4,21 +4,17 @@ COVERAGE: `Format` (`VALUE`, `FORWARDREF`, `STRING`, with CPython's own integer
 values so a program comparing against a literal `1`/`3`/`4` still agrees);
 `get_annotations` for `format=Format.VALUE` (the default and the only format
 this runtime can produce), on functions, classes and plain objects, with
-`eval_str` un-stringizing a BARE-IDENTIFIER annotation a program wrote as a
-literal string (`x: "SomeClass"`); `call_annotate_function` and
+`eval_str` un-stringizing an annotation a program wrote as a literal string
+(`x: "SomeClass"`, `x: "list[int]"`); `call_annotate_function` and
 `call_evaluate_function` for `Format.VALUE`; `get_annotate_from_class_namespace`;
 `ForwardRef` -- construction, equality, repr, and `.evaluate()` in all three
-formats for a BARE IDENTIFIER.
+formats.
 
 NOT COVERED, and REFUSED BY NAME rather than accepted and given the wrong
 answer: `format=Format.FORWARDREF` and `format=Format.STRING` in
-`get_annotations` and `call_annotate_function` (this runtime's `__annotate__`
-thunk does not have what either needs -- see below); and, in both
-`ForwardRef.evaluate()` and `get_annotations(eval_str=True)`, any text that is
-not a single bare identifier (`"list[int]"`, `"int | None"`, anything with an
-operator in it) -- because resolving one of those needs `eval()`, and
-`eval()` cannot be called from inside a bundled module at all, which is a
-compiler bug found while writing this module and documented in full below.
+`get_annotations` and `call_annotate_function` -- this runtime's
+`__annotate__` thunk does not have what either needs, which is the one
+limit here and is explained below.
 
 ## Why VALUE is what this runtime can give
 
@@ -69,65 +65,58 @@ anything, rather than trusting the thunk to refuse a format it cannot
 honour. A thunk that silently answered VALUE data for a STRING request is
 exactly the "accepted and ignored" failure this rebuild exists to catch.
 
-## `eval()` cannot be called from inside a bundled module -- found writing this
+## How a forward reference is resolved, and the compiler gap this module found
 
-`ForwardRef.evaluate()` and `get_annotations(..., eval_str=True)` both need
-to turn a piece of text back into a value, which is what `eval()` is for --
-and calling it from here crashed the COMPILER, not the compiled program:
-`KeyError: 'eval'` out of `frontends/python/dynamic.py`'s `_dyn_call`, for a
-name that is plainly a Python builtin.
+`ForwardRef.evaluate()` and `get_annotations(..., eval_str=True)` both turn a
+piece of text back into a value, which is what `eval()` is for. When this
+module was first written, calling `eval()` from here crashed the COMPILER
+rather than the compiled program: `KeyError: 'eval'` out of
+`frontends/python/dynamic.py`'s `_dyn_call`, for a name that is plainly a
+Python builtin.
 
-The cause is in `bundled.py`. `splice()` rewrites `eval`/`exec`/`compile` to
-the bundled `_pyrun`/`_pycompile` implementations, but only in the PROGRAM'S
-OWN source tree (`_Rewrite`, and the `uses` scan that decides whether
-`_pyrun` is even spliced in at all, both walk the caller's tree BEFORE any
+The cause was in `bundled.py`. `splice()` rewrites `eval`/`exec`/`compile` to
+the bundled `_pyrun`/`_pycompile` implementations, and did so only in the
+PROGRAM'S OWN source tree (`_Rewrite`, and the `uses` scan that decides
+whether `_pyrun` is spliced in at all, both walk the caller's tree BEFORE any
 bundled module is merged into it). A bundled module's OWN body is rewritten
-by a DIFFERENT visitor, `_Rename`, whose whole job is mangling the module's
-own top-level names and its references to OTHER bundled modules --
-`_RUNTIME_COMPILER` never enters into it, and `_dependencies()` (which finds
-what a bundled module transitively needs) only follows `import` statements,
-never a bare `eval`/`exec`/`compile` name. So a program that never calls
-`eval` ITSELF still never gets `_pyrun` spliced in, even when a bundled
-module IT imports calls `eval` internally -- and the name reaches lowering
-unrewritten, where it is not a defined function and not a known builtin
-either, which is exactly the `KeyError` above rather than a diagnostic.
-Nothing tests this today because no bundled module before this one called
-`eval`, `exec` or `compile` from its own body.
+by a DIFFERENT visitor, `_Rename`, whose job is mangling the module's own
+top-level names and its references to other bundled modules --
+`_RUNTIME_COMPILER` did not enter into it, and `_dependencies()` followed
+only `import` statements, never a bare `eval`/`exec`/`compile` name. So a
+program that never called `eval` ITSELF never got `_pyrun` spliced in even
+when a bundled module it imported called `eval` internally, and the name
+reached lowering unrewritten -- not a defined function and not a known
+builtin, which is the `KeyError` above rather than a diagnostic. Nothing
+caught it because no bundled module before this one called any of the three
+from its own body.
 
-That is a real, fixable compiler gap -- `_dependencies()` would need to scan
-each bundled module's source for the same three names `splice()`'s own
-`uses` scan looks for, and `_Rename` would need `_RUNTIME_COMPILER`'s
-rewrite alongside its own. It is NOT fixed here: it touches the splice
-machinery every one of the other twenty-odd bundled modules goes through,
-which is a wider and riskier change than this module's own job, and this
-module has a narrower way to do what it actually needs.
+THAT GAP IS CLOSED. `_dependencies()` now scans each bundled module's tree
+for the same three names `splice()`'s own `uses` scan looks for and visits
+the provider, and `_Rename` rewrites them alongside the names it already
+mangled. `tests/stdlib/annotationlib.py` is what holds it closed: the
+non-identifier cases below reach `eval()` for real.
 
-## What it needs instead, and what that gives up
+A BARE IDENTIFIER STILL DOES NOT GO THROUGH `eval()`, and that is a choice
+rather than a leftover. It is what almost every forward reference is
+(`ForwardRef("SomeClass")`, not `ForwardRef("some_class.Attr[int]")`), it
+needs no interpreter -- only `locals`, then `globals`, then a small table of
+the builtin types an annotation is written with -- and it is the one path
+whose namespace this module controls.
 
-Resolving a forward reference is, almost always, resolving ONE NAME --
-`ForwardRef("SomeClass")`, not `ForwardRef("some_class.Attr[int]")` -- and a
-single name needs no interpreter, only a lookup: `locals`, then `globals`,
-then a small table of the builtin types an annotation is written with.
-`_resolve_name` below is exactly that lookup, and it is the whole of what
-`ForwardRef.evaluate()` and `get_annotations(eval_str=True)` do here.
-
-REFUSED BY NAME, and only here: a forward reference that is not a bare
-identifier (`"list[int]"`, `"int | None"`, anything with an operator or a
-call in it) raises `NotImplementedError` explaining why, rather than being
-silently left as a string or crashing the compiler the way calling `eval()`
-directly would. `Format.STRING` is unaffected -- it never evaluates
-anything, so it costs nothing.
-
-NO IMPLICIT BUILTINS FALLBACK BEYOND THAT SMALL TABLE. CPython's own
-`ForwardRef.evaluate()` falls back to `hasattr(builtins, arg)` for any
-builtin name, including ones this frontend refuses to let a program name as
-a bare VALUE (`bytearray`, `range`, `memoryview`, `complex` -- see
+NO IMPLICIT BUILTINS FALLBACK BEYOND THAT SMALL TABLE, for a bare name.
+CPython's own `ForwardRef.evaluate()` falls back to `hasattr(builtins, arg)`
+for any builtin name, including ones this frontend refuses to let a program
+name as a bare VALUE (`bytearray`, `range`, `memoryview`, `complex` -- see
 `dataclasses.py`'s mutable-default check and `docs/STDLIB.md`'s
 `collections.abc` entry for the same restriction from two other angles), so
 the table here is the safe subset: `int`, `str`, `float`, `bool`, `bytes`,
 `list`, `tuple`, `dict`, `set`, `frozenset`, `object`, `type`. A name outside
 `locals`/`globals` and outside that table raises `NameError`, matching
-CPython's own message text for an undefined name.
+CPython's own message text for an undefined name. Text that is NOT a bare
+identifier goes to `eval()`, which resolves a free name against `_pyrun`'s
+own wider builtins table -- so `"range[int]"` resolves where `"range"` alone
+does not. That asymmetry is deliberate: the wide table is `_pyrun`'s to
+define, and narrowing it from here would mean re-implementing it.
 """
 import enum
 
@@ -160,28 +149,32 @@ _BUILTIN_NAMES = {
 
 
 def _resolve_name(text, globals, locals):
-    """`locals`, then `globals`, then the safe builtin table -- what a bare
-    identifier forward reference resolves against here, in place of `eval()`
-    (see the module docstring for why `eval()` itself is not an option).
+    """`locals`, then `globals`, then the safe builtin table for a BARE
+    IDENTIFIER; `eval()` for anything else.
 
-    `text` NOT BEING A BARE IDENTIFIER is refused here rather than one call
-    up, so both callers -- `ForwardRef.evaluate` and
-    `get_annotations(eval_str=True)` -- give the same answer for the same
-    text.
+    THE BARE-IDENTIFIER PATH IS NOT AN OPTIMISATION. It is what almost every
+    forward reference is (`ForwardRef("SomeClass")`), it needs no interpreter,
+    and it is the one path whose namespace this module controls: `eval()`
+    resolves a free name against `_pyrun`'s OWN builtins table, which is wider
+    than `_BUILTIN_NAMES` on purpose (see the module docstring for why the
+    table here is the narrow one). Sending a bare name to `eval()` instead
+    would quietly widen that table for the commonest case.
+
+    Anything with an operator, a call or a subscript in it -- `"list[int]"`,
+    `"int | None"` -- is what `eval()` is for, and is what CPython resolves it
+    with too. Whatever `eval()` cannot parse or cannot evaluate raises from
+    there, with `_pyrun`'s own message; this function adds no refusal of its
+    own.
     """
-    if not text.isidentifier():
-        raise NotImplementedError(
-            "cannot resolve %r without eval(), which cannot be called from "
-            "inside a bundled module here -- only a bare identifier forward "
-            "reference can be resolved. See bundled/annotationlib.py." %
-            (text,))
-    if text in locals:
-        return locals[text]
-    if text in globals:
-        return globals[text]
-    if text in _BUILTIN_NAMES:
-        return _BUILTIN_NAMES[text]
-    raise NameError("name '%s' is not defined" % (text,))
+    if text.isidentifier():
+        if text in locals:
+            return locals[text]
+        if text in globals:
+            return globals[text]
+        if text in _BUILTIN_NAMES:
+            return _BUILTIN_NAMES[text]
+        raise NameError("name '%s' is not defined" % (text,))
+    return eval(text, globals, locals)
 
 
 def _refuse(format, where):
@@ -248,9 +241,9 @@ class ForwardRef:
         not compile `type` statements or generic `class`/`def` parameter
         lists, so there is never one to inject.
 
-        ONLY A BARE IDENTIFIER can be resolved for `Format.VALUE` and
-        `Format.FORWARDREF` -- see the module docstring for why `eval()` is
-        not available here to handle anything more.
+        A BARE IDENTIFIER is resolved by lookup and anything else by
+        `eval()` -- see `_resolve_name`, and the module docstring for why the
+        two paths differ.
         """
         if format == Format.STRING:
             return self.__forward_arg__
@@ -396,10 +389,9 @@ def get_annotations(obj, *, globals=None, locals=None, eval_str=False,
     compiler rewrite here; see `frontends/python/__init__.py`'s `_Stringify`
     -- it replaces each annotation with its own `ast.unparse`d source, so
     under it every value already IS a string before this function ever sees
-    it) -- PROVIDED the string is a bare identifier: `eval()` cannot be
-    called from inside a bundled module here (see the module docstring), so
-    `"list[int]"` or any other compound text raises `NotImplementedError`
-    rather than being silently left as a string. `globals`/`locals` are
+    it). A bare identifier is resolved by lookup and anything else --
+    `"list[int]"`, `"int | None"` -- by `eval()`; see `_resolve_name`.
+    `globals`/`locals` are
     consulted the same way `ForwardRef.evaluate` consults them; unlike
     CPython, this runtime keeps no live module registry to default them from
     (see `docs/STDLIB.md`: "no module object, no import system"), so a class

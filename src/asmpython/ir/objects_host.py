@@ -933,7 +933,7 @@ class ObjectHost:
         if isinstance(v, Alias):
             # A UNION IS NOT A GENERIC ALIAS to a program that asks:
             # `type(int | str).__name__` is how it tells the two apart.
-            return "Union" if isinstance(v.origin, Instance)                 else "types.GenericAlias"
+            return "typing.Union" if isinstance(v.origin, Instance)                 else "types.GenericAlias"
         if isinstance(v, Func) and getattr(v, "is_type", False):
             return "type"
         if isinstance(v, _VIEW_TYPES):
@@ -2772,8 +2772,8 @@ def _apy_type_name(h, a):
     v = h._get(a[0], "apy_type_name")
     got = h._type_of(v)
     if isinstance(got, Class):
-        return h._new(got.name)
-    return h._new(h.kind_name(v))
+        return h._new(_bare_name(got.name))
+    return h._new(_bare_name(h.kind_name(v)))
 
 
 def _apy_truth(h, a):
@@ -3001,7 +3001,7 @@ def _apy_getitem(h, a):
             for one in args:
                 arms.extend(_union_arms(one))
             arms.extend(_union_arms(None))
-            return h._new(Alias(_union_form(h), tuple(arms)))
+            return h._new(Alias(_union_form(h), tuple(_dedup_arms(arms))))
         return h._new(Alias(seq, args))
     if isinstance(seq, Instance):
         if seq.cls.find("__getitem__") is None and seq.held is not None:
@@ -4063,9 +4063,28 @@ def _math_real(h, v, fn):
     return v
 
 
-def _math1(name, fn, want_int=False):
+def _math1(name, fn, want_int=False, dunder=None):
     def run(h, a):
         v = h._get(a[0], name)
+        if dunder is not None and isinstance(v, Instance):
+            # PEP 3141'S HOOK, and the reason `math.floor` has one at all:
+            # `Fraction(7, 2)` and `Decimal("3.5")` are real numbers that
+            # are not `float`, and the only way `math.floor` can round one
+            # is to ask it. CPython's `floor`/`ceil`/`trunc` each look for
+            # their own dunder BEFORE trying to make a float, so a class
+            # defining it never reaches the float conversion -- which is
+            # what made `math.floor(Fraction(7, 2))` a TypeError here
+            # while CPython answered 3. `bundled/fractions.py` found it.
+            #
+            # NOT `__index__`, and not a fallback to it: a class with
+            # `__index__` and no `__floor__` is an integer-like object
+            # whose float conversion is exact, so the ordinary path below
+            # is right for it.
+            if v.cls.find(dunder) is not None:
+                try:
+                    return h._value(v._send(dunder))
+                except _UserFailed:
+                    return 0
         if want_int:
             # A BOOL IS AN INT HERE TOO -- `math.isqrt(True)` is 1. See
             # `_math_real`.
@@ -4100,6 +4119,181 @@ def _math2(name, fn, want_int=False):
         try:
             return h._value(fn(x, y))
         except (ValueError, OverflowError, ZeroDivisionError) as exc:
+            return h._fail_like(exc)
+    return run
+
+
+def _apy_math_log(h, a):
+    """`log(x)` and `log(x, base)` -- see the C's own comment on why the
+    base defaults to a sentinel rather than to `e`."""
+    x = _math_real(h, h._get(a[0], "apy_math_log"), "apy_math_log")
+    if x is None:
+        return 0
+    if x <= 0:
+        return h._fail("ValueError", "math domain error")
+    base = h._get(a[1], "apy_math_log") if len(a) > 1 and a[1] else None
+    if base is None:
+        return h._value(math.log(x))
+    base = _math_real(h, base, "apy_math_log")
+    if base is None:
+        return 0
+    if base <= 0:
+        return h._fail("ValueError", "math domain error")
+    try:
+        return h._value(math.log(x, base))
+    except (ValueError, ZeroDivisionError) as exc:
+        return h._fail_like(exc)
+
+
+def _apy_math_frexp(h, a):
+    """`frexp(x)` -- `(mantissa, exponent)` with `x == m * 2 ** e`. A PAIR,
+    which is why it is not in the one-argument family above."""
+    v = _math_real(h, h._get(a[0], "apy_math_frexp"), "apy_math_frexp")
+    if v is None:
+        return 0
+    return h._new(math.frexp(v))
+
+
+def _apy_math_modf(h, a):
+    """`modf(x)` -- `(fractional, integral)`, both floats. FRACTIONAL
+    FIRST, which is CPython's order and the opposite of what the name
+    suggests to most readers."""
+    v = _math_real(h, h._get(a[0], "apy_math_modf"), "apy_math_modf")
+    if v is None:
+        return 0
+    return h._new(math.modf(v))
+
+
+def _seq_of_reals(h, v, name):
+    """A sequence of floats from whatever a caller passed -- a list, a
+    tuple, a range or a generator, drained the way `apy_iterable` drains
+    one on the compiled side so the two agree about what is iterable."""
+    if isinstance(v, (Gen, Iterator)) or not isinstance(
+            v, (list, tuple, set, frozenset, range)):
+        v = h._get(_apy_iterable(h, [h._value(v)]), name)
+    out = []
+    for one in v:
+        got = _math_real(h, one, name)
+        if got is None:
+            return None
+        out.append(got)
+    return out
+
+
+def _apy_math_fsum(h, a):
+    """`fsum(iterable)` -- an EXACT sum, which is the whole difference from
+    `sum`: `sum([0.1] * 10)` is 0.9999999999999999 and this is 1.0."""
+    items = _seq_of_reals(h, h._get(a[0], "apy_math_fsum"), "apy_math_fsum")
+    if items is None:
+        return 0
+    try:
+        return h._value(math.fsum(items))
+    except (ValueError, OverflowError) as exc:
+        return h._fail_like(exc)
+
+
+def _apy_math_prod(h, a):
+    """`prod(iterable, start=1)`.
+
+    THROUGH THE ORDINARY MULTIPLY, so an integer product stays exact and
+    promotes to a big rather than losing low bits in a double --
+    `prod(range(1, 21))` is 2432902008176640000. The `start` decides the
+    type of an empty product, as in CPython.
+    """
+    v = h._get(a[0], "apy_math_prod")
+    acc = h._get(a[1], "apy_math_prod") if len(a) > 1 and a[1] else 1
+    if isinstance(v, (Gen, Iterator)) or not isinstance(
+            v, (list, tuple, set, frozenset, range)):
+        v = h._get(_apy_iterable(h, [h._value(v)]), "apy_math_prod")
+    for one in v:
+        if not isinstance(one, (int, float)):
+            return h._fail("TypeError",
+                           f"unsupported operand type(s) for *: "
+                           f"'{h.kind_name(acc)}' and '{h.kind_name(one)}'")
+        acc = acc * one
+    return h._value(acc)
+
+
+def _apy_math_fma(h, a):
+    """`fma(x, y, z)` -- `x * y + z` with ONE rounding."""
+    got = []
+    for one in a[:3]:
+        v = _math_real(h, h._get(one, "apy_math_fma"), "apy_math_fma")
+        if v is None:
+            return 0
+        got.append(v)
+    try:
+        return h._value(math.fma(got[0], got[1], got[2]))
+    except (ValueError, OverflowError) as exc:
+        return h._fail_like(exc)
+
+
+def _apy_math_sumprod(h, a):
+    """`sumprod(p, q)` -- the dot product, INTEGER-PRESERVING like `prod`."""
+    p = h._get(a[0], "apy_math_sumprod")
+    q = h._get(a[1], "apy_math_sumprod")
+    pairs = []
+    for v in (p, q):
+        if isinstance(v, (Gen, Iterator)) or not isinstance(
+                v, (list, tuple, set, frozenset, range)):
+            v = h._get(_apy_iterable(h, [h._value(v)]), "apy_math_sumprod")
+        pairs.append(list(v))
+    if len(pairs[0]) != len(pairs[1]):
+        return h._fail("ValueError", "Inputs are not the same length")
+    acc = 0
+    for x, y in zip(pairs[0], pairs[1]):
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return h._fail("TypeError",
+                           f"unsupported operand type(s) for *: "
+                           f"'{h.kind_name(x)}' and '{h.kind_name(y)}'")
+        acc = acc + x * y
+    return h._value(acc)
+
+
+def _apy_math_dist(h, a):
+    """`dist(p, q)` -- the Euclidean distance between two points."""
+    p = _seq_of_reals(h, h._get(a[0], "apy_math_dist"), "apy_math_dist")
+    if p is None:
+        return 0
+    q = _seq_of_reals(h, h._get(a[1], "apy_math_dist"), "apy_math_dist")
+    if q is None:
+        return 0
+    if len(p) != len(q):
+        return h._fail("ValueError",
+                       "both points must have the same number of dimensions")
+    return h._value(math.dist(p, q))
+
+
+def _math_choose(name, fn):
+    """`math.comb` and `math.perm`, which are `_math2` plus one refusal.
+
+    A BIG ARGUMENT IS REFUSED, and the refusal is what this wrapper exists
+    for rather than `_math2`. Both functions loop `k` times in the
+    compiled arrangements (`objects/c/_math.py`, `runtime/mathints.py`),
+    so a `k` that does not fit a machine word is a loop that never
+    finishes -- and a big `n` needs the whole falling factorial in big
+    arithmetic, which those two do not have. CPython answers both,
+    eventually. Refusing HERE TOO is what keeps the three arrangements
+    saying the same thing, which is the property this runtime is measured
+    on; answering where the others cannot would be a divergence nothing
+    tests for.
+    """
+    def run(h, a):
+        x = h._get(a[0], name)
+        y = h._get(a[1], name)
+        for v in (x, y):
+            if not isinstance(v, int):
+                return h._fail("TypeError",
+                               "'float' object cannot be interpreted as "
+                               "an integer")
+        if not -(1 << 63) < int(x) < (1 << 63) \
+                or not -(1 << 63) < int(y) < (1 << 63):
+            return h._fail("OverflowError",
+                           "comb()/perm() arguments must fit in a machine "
+                           "word here")
+        try:
+            return h._value(fn(int(x), int(y)))
+        except (ValueError, OverflowError) as exc:
             return h._fail_like(exc)
     return run
 
@@ -4764,7 +4958,7 @@ def _binop(name, op, sym):
         # arms flatten, so `int | str | None` is one three-armed union.
         if sym == "|" and _is_type_like(x) and _is_type_like(y):
             arms = _union_arms(x) + _union_arms(y)
-            return h._new(Alias(_union_form(h), tuple(arms)))
+            return h._new(Alias(_union_form(h), tuple(_dedup_arms(arms))))
         # BEFORE `_reject`, which sees a builtin-extending instance as
         # neither a sequence nor a number and reports an unsupported pair --
         # so a substitution made after it never gets the chance.
@@ -4797,11 +4991,16 @@ def _binop(name, op, sym):
         except _UserFailed:
             return 0
         except TypeError as e:
-            if isinstance(x, Instance) or isinstance(y, Instance):
-                # Python's own message would name `Instance`, which is this
-                # file's class and not the program's type. The C reports the
-                # operand pair by kind name, and kind_name answers with the
-                # user's class.
+            # Python's own message would name `Instance` -- this file's class
+            # and not the program's type -- and the same is true of every
+            # other wrapper here: `list[int] + 1` reported `'Alias'`, a name
+            # no program has ever seen, where CPython says
+            # `'types.GenericAlias'`. THE TEST IS WHETHER THE TWO NAMES AGREE:
+            # for an int, a str or a list the Python class IS the kind and the
+            # message is already right, so it is kept along with the more
+            # specific text CPython has for those pairs.
+            if (type(x).__name__ != h.kind_name(x)
+                    or type(y).__name__ != h.kind_name(y)):
                 return h._binop_error(sym.split(" ")[0], x, y)
             return h._fail_like(e)
         except (ValueError, ZeroDivisionError, OverflowError) as e:
@@ -5018,6 +5217,28 @@ def _form_name(v):
         got = v.dict.get("_name")
         return str(got) if got is not None else None
     return None
+
+
+def _arm_key(args):
+    """A union's arms as an ORDER-FREE, DUPLICATE-FREE key.
+
+    A `frozenset` would be the obvious one and cannot be used: an arm may be
+    an `Instance` whose `__hash__` is the program's own, and hashing one from
+    inside `Alias.__hash__` re-enters user code. Identity is what the arms are
+    compared by everywhere else here, so identity is what keys them.
+    """
+    return frozenset(id(one) for one in args)
+
+
+def _dedup_arms(arms):
+    """`int | str | int` HAS TWO ARMS. CPython drops a repeat when it builds
+    the union, so the repr shows it once; keeping it showed `int | str | int`
+    where CPython shows `int | str`."""
+    out = []
+    for one in arms:
+        if not any(x is one for x in out):
+            out.append(one)
+    return out
 
 
 def _union_form(h):
@@ -5466,6 +5687,22 @@ class Cell:
 
     def __init__(self, initial=None) -> None:
         self.slot = initial
+
+
+def _bare_name(name: str) -> str:
+    """A type's `__name__` is the LAST COMPONENT of its dotted name.
+
+    Two kinds here are named the way CPython names them in a message --
+    `types.GenericAlias` and `typing.Union` -- because that is what
+    `unsupported operand type(s) for +` prints and what `<class '...'>` shows.
+    `__name__` is the other half of the same rule: CPython answers
+    `GenericAlias` and `Union`, with the module in `__module__` and never in
+    the name. One dotted string serves both, split here.
+
+    EVERY OTHER NAME PASSES THROUGH UNCHANGED. No identifier can hold a dot,
+    so a class the program wrote is never affected.
+    """
+    return name.rsplit(".", 1)[-1]
 
 
 #: "no such attribute", told apart from an attribute whose VALUE is None.
@@ -6706,7 +6943,7 @@ def _apy_default_getattr(h, a):
         return h._no_attr(obj, name)
     if isinstance(obj, Class):
         if name == "__name__":
-            return h._new(obj.name)
+            return h._new(_bare_name(obj.name))
         # What the class BODY bound, not what it inherited -- the difference
         # `"x" in vars(C)` asks about. A copy: a type's dict is a mapping
         # proxy in CPython and is not writable.
@@ -8382,6 +8619,46 @@ class Alias:
         self.origin = origin
         self.args = args
 
+    def __eq__(self, other):
+        """`list[int] == list[int]` -- SAME ORIGIN, SAME ARGUMENTS.
+
+        Without this a parameterised type compared by identity, so two
+        spellings of one annotation were never equal, `hash` disagreed with
+        `==`, and a set of them kept every duplicate. `typing.get_type_hints`
+        style code that keys on an alias got a fresh bucket per lookup.
+
+        THE ORIGIN IS COMPARED BY IDENTITY on purpose. A union's origin is a
+        `typing` special form, which is an `Instance` -- and `Instance.__eq__`
+        runs the program's own `__eq__`, which must not be re-entered from
+        inside a host dunder that a container is already walking. Every origin
+        a program can build is one interned object, so identity is the same
+        answer.
+
+        A UNION'S ARMS ARE COMPARED ORDER-FREE, because `int | str` and
+        `str | int` are the same type in CPython, and duplicates do not count
+        (`int | str | int` equals `int | str`). ONLY a union: `tuple[int, str]`
+        and `tuple[str, int]` are different types, so every other form -- a
+        builtin origin, `Callable`, `Tuple` -- compares its arguments in
+        order.
+        """
+        if not isinstance(other, Alias):
+            return NotImplemented
+        if self.origin is not other.origin:
+            return False
+        if _form_name(self.origin) == "Union":
+            return _arm_key(self.args) == _arm_key(other.args)
+        return self.args == other.args
+
+    def __hash__(self):
+        # EQUAL ALIASES HASH EQUALLY, which is the whole reason this is here
+        # alongside `__eq__`: one without the other puts two equal aliases in
+        # two buckets. `id` for the origin mirrors the identity comparison
+        # above; an unhashable argument (`list[[]]`) raises TypeError from
+        # here, which is what CPython does too.
+        if _form_name(self.origin) == "Union":
+            return hash((id(self.origin), _arm_key(self.args)))
+        return hash((id(self.origin), self.args))
+
 
 def _alias_part(x) -> str:
     """How one piece of an alias renders.
@@ -9113,18 +9390,54 @@ _TABLE.update({
     "apy_as_integer_ratio": _apy_as_integer_ratio,
     "apy_str_expandtabs": _apy_str_expandtabs,
     "apy_math_sqrt": _math1("apy_math_sqrt", math.sqrt),
-    "apy_math_floor": _math1("apy_math_floor", math.floor),
-    "apy_math_ceil": _math1("apy_math_ceil", math.ceil),
-    "apy_math_trunc": _math1("apy_math_trunc", math.trunc),
+    "apy_math_floor": _math1("apy_math_floor", math.floor,
+                             dunder="__floor__"),
+    "apy_math_ceil": _math1("apy_math_ceil", math.ceil, dunder="__ceil__"),
+    "apy_math_trunc": _math1("apy_math_trunc", math.trunc,
+                             dunder="__trunc__"),
     "apy_math_fabs": _math1("apy_math_fabs", math.fabs),
     "apy_math_isnan": _math1("apy_math_isnan", math.isnan),
     "apy_math_isinf": _math1("apy_math_isinf", math.isinf),
     "apy_math_isfinite": _math1("apy_math_isfinite", math.isfinite),
+    # THE REST OF libm, matching `objects/c/_math.py` name for name.
+    # `math` here IS the specification -- see this section's own
+    # header -- so each is the CPython function of the same name, and
+    # the C reimplements it.
+    "apy_math_acos": _math1("apy_math_acos", math.acos),
+    "apy_math_asin": _math1("apy_math_asin", math.asin),
+    "apy_math_acosh": _math1("apy_math_acosh", math.acosh),
+    "apy_math_asinh": _math1("apy_math_asinh", math.asinh),
+    "apy_math_atanh": _math1("apy_math_atanh", math.atanh),
+    "apy_math_cosh": _math1("apy_math_cosh", math.cosh),
+    "apy_math_sinh": _math1("apy_math_sinh", math.sinh),
+    "apy_math_tanh": _math1("apy_math_tanh", math.tanh),
+    "apy_math_expm1": _math1("apy_math_expm1", math.expm1),
+    "apy_math_log1p": _math1("apy_math_log1p", math.log1p),
+    "apy_math_erf": _math1("apy_math_erf", math.erf),
+    "apy_math_erfc": _math1("apy_math_erfc", math.erfc),
+    "apy_math_gamma": _math1("apy_math_gamma", math.gamma),
+    "apy_math_lgamma": _math1("apy_math_lgamma", math.lgamma),
+    "apy_math_cbrt": _math1("apy_math_cbrt", math.cbrt),
+    "apy_math_exp2": _math1("apy_math_exp2", math.exp2),
+    "apy_math_ulp": _math1("apy_math_ulp", math.ulp),
+    "apy_math_fmod": _math2("apy_math_fmod", math.fmod),
+    "apy_math_remainder": _math2("apy_math_remainder", math.remainder),
+    "apy_math_nextafter": _math2("apy_math_nextafter", math.nextafter),
+    "apy_math_ldexp": _math2("apy_math_ldexp", math.ldexp),
+    "apy_math_frexp": _apy_math_frexp,
+    "apy_math_modf": _apy_math_modf,
+    "apy_math_fsum": _apy_math_fsum,
+    "apy_math_prod": _apy_math_prod,
+    "apy_math_dist": _apy_math_dist,
+    "apy_math_fma": _apy_math_fma,
+    "apy_math_sumprod": _apy_math_sumprod,
     "apy_math_isqrt": _math1("apy_math_isqrt", math.isqrt, want_int=True),
+    "apy_math_comb": _math_choose("apy_math_comb", math.comb),
+    "apy_math_perm": _math_choose("apy_math_perm", math.perm),
     "apy_math_factorial": _math1("apy_math_factorial", math.factorial,
                                  want_int=True),
     "apy_math_exp": _math1("apy_math_exp", math.exp),
-    "apy_math_log": _math1("apy_math_log", math.log),
+    "apy_math_log": _apy_math_log,
     "apy_math_log2": _math1("apy_math_log2", math.log2),
     "apy_math_log10": _math1("apy_math_log10", math.log10),
     "apy_math_sin": _math1("apy_math_sin", math.sin),

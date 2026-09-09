@@ -196,6 +196,15 @@ def _dependencies(wanted, have):
     A depth-first walk with the module emitted AFTER what it needs, which is
     the order the prelude has to be in: a spliced definition referring to
     another module's name is only correct once that name exists.
+
+    `eval`, `exec` AND `compile` COUNT AS DEPENDENCIES HERE TOO. They are
+    BUILTINS, so no import brings them in and nothing above this function
+    would have noticed one -- the scan in `splice` walks the PROGRAM's tree
+    and stops there. A bundled module calling `eval` in its own body
+    therefore got `_pyrun` spliced only when the program happened to name
+    `eval` as well, and otherwise failed with `error: 'eval'`.
+    `bundled/annotationlib.py` documented it as the reason a stringized
+    annotation could not be resolved.
     """
     order, seen = [], set()
 
@@ -204,13 +213,23 @@ def _dependencies(wanted, have):
             return
         seen.add(name)
         source = (_HERE / f"{name}.py").read_text(encoding="utf-8")
-        for stmt in ast.parse(source, filename=f"<bundled {name}>").body:
+        tree = ast.parse(source, filename=f"<bundled {name}>")
+        for stmt in tree.body:
             if isinstance(stmt, ast.ImportFrom) and stmt.module in have:
                 visit(stmt.module)
             elif isinstance(stmt, ast.Import):
                 for alias in stmt.names:
                     if alias.name in have:
                         visit(alias.name)
+        # AFTER the imports and BEFORE this module is emitted, so the
+        # compiler it needs is already in the prelude when its own body
+        # arrives. `_module_bindings` keeps a module that defines its OWN
+        # `compile` from being rewritten to somebody else's.
+        own = _module_bindings(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id in _RUNTIME_COMPILER \
+                    and node.id not in own:
+                visit(_RUNTIME_COMPILER[node.id])
         order.append(name)
 
     for one in dict.fromkeys(wanted):
@@ -261,6 +280,25 @@ class _Rename(ast.NodeTransformer):
             node.id = _mangled(self.module, node.id, self.prefix)
         elif node.id in self.borrowed:
             node.id = self.borrowed[node.id]
+        elif node.id in _RUNTIME_COMPILER and self.members is not None:
+            # `eval`, `exec` AND `compile` IN A BUNDLED MODULE'S OWN BODY.
+            # They are builtins, so nothing imports them and neither
+            # `defined` nor `borrowed` has them -- the name went through
+            # unrewritten and the program failed with `error: 'eval'`.
+            # `_Rewrite` has had this branch for the PROGRAM's half since
+            # `_pycompile` was written; this is the same rule on the other
+            # side, and `_dependencies` is what makes sure the module
+            # providing it is already in the prelude.
+            #
+            # `members` IS THE GATE, not a convenience: it holds what each
+            # spliced module defines, so `compile in members["_pycompile"]`
+            # is the test for "was the compiler actually spliced". A module
+            # that names `eval` in a program where `_pyrun` was somehow not
+            # brought in keeps the builtin's own refusal rather than being
+            # rewritten to a name that does not exist.
+            provider = _RUNTIME_COMPILER[node.id]
+            if node.id in self.members.get(provider, ()):
+                node.id = _mangled(provider, node.id, self.prefix)
         return node
 
     def visit_FunctionDef(self, node):

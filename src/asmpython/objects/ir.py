@@ -337,6 +337,12 @@ REPLACES: dict[str, tuple[str, ...]] = {
     "cursor.py": ("apy_str_cmp_of", "apy_cursor_of"),
     "mathints.py": ("apy_math_gcd", "apy_math_factorial", "apy_view_items",
                     "apy_math_lcm",
+                    # `comb` AND `perm` came with the big-integer fix to
+                    # `gcd`: all four multiply through `apy_mul`, so all
+                    # four promote past a machine word the way `2 ** 100`
+                    # does. Listed here so the C's own definitions stand
+                    # aside -- two bodies for one symbol is a link error.
+                    "apy_math_comb", "apy_math_perm",
                     # THE NUMERIC WALLS. `apy_math_arg` is the biggest blocker
                     # `asmpython port` reports and is five lines; what kept it
                     # in the C was `static`, not difficulty.

@@ -1071,6 +1071,26 @@ class Decimal:
     def __trunc__(self):
         return self.__int__()
 
+    def __floor__(self):
+        """PEP 3141, and `math.floor(Decimal("3.5"))` is how it is reached.
+
+        TOWARD MINUS INFINITY, which is what makes this different from
+        `__trunc__`: `__int__` rounds toward zero, so a negative number
+        with a fraction has to go one further down. CPython's own
+        `__floor__` is exactly this pair of lines.
+        """
+        floored = self.__int__()
+        if self._sign and floored != self:
+            return floored - 1
+        return floored
+
+    def __ceil__(self):
+        """The other half, toward plus infinity."""
+        ceiled = self.__int__()
+        if not self._sign and ceiled != self:
+            return ceiled + 1
+        return ceiled
+
     def __float__(self):
         if self._is_special:
             if self.is_nan():

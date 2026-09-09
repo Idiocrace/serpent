@@ -503,6 +503,13 @@ def apy_unhashable_of(v: ptr) -> ptr:
                 return bad
             i = i + 1
         return ptr(0)
+    if k == apy_alias_kind():
+        # AN ALIAS IS AS HASHABLE AS ITS ARGUMENTS, for the same reason a
+        # tuple is: the hash combines them, so `list[[]]` would otherwise be
+        # hashed through a list -- by address, silently, where CPython raises
+        # `unhashable type: 'list'`.
+        return apy_unhashable_of(
+            ptr(load(u64, offset(v, apy_ga_args_offset()))))
     if k == apy_inst_kind():
         cls: ptr = ptr(load(u64, offset(v, apy_o_cls_offset())))
         if not apy_class_find_of(cls, apy_name_of(rodata(b"__hash__\0"))):

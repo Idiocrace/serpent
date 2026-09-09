@@ -217,11 +217,26 @@ def apy_whole_int(v: ptr) -> ptr:
 
 
 def apy_math_floor(v: ptr) -> ptr:
-    """`math.floor(x)`. An integer already there is answered unchanged."""
+    """`math.floor(x)`. An integer already there is answered unchanged.
+
+    PEP 3141'S HOOK COMES FIRST, before any float conversion. `floor`,
+    `ceil` and `trunc` are the three math functions with a dunder of their
+    own, and asking for it is the ONLY way a real number that is not a
+    float can be rounded: `Fraction(7, 2)` and `Decimal("3.5")` both
+    define one and neither converts exactly to a double. A class with no
+    `__floor__` falls through to the conversion below, which is where a plain
+    object is refused.
+    """
     if apy_is_int_like_of(v):
         return apy_whole_int(v)
     if apy_is_big_of(v):
         return v
+    if i64(load(i32, offset(v, apy_kind_offset()))) == apy_inst_kind():
+        got: ptr = apy_unary_dunder_of(v, rodata(b"__floor__\0"))
+        if got:
+            return got
+        if apy_err_kind():
+            return ptr(0)
     x: f64 = apy_math_arg_of(v, rodata(b"floor\0"))
     if apy_err_kind():
         return ptr(0)
@@ -229,11 +244,26 @@ def apy_math_floor(v: ptr) -> ptr:
 
 
 def apy_math_ceil(v: ptr) -> ptr:
-    """`math.ceil(x)`."""
+    """`math.ceil(x)`.
+
+    PEP 3141'S HOOK COMES FIRST, before any float conversion. `floor`,
+    `ceil` and `trunc` are the three math functions with a dunder of their
+    own, and asking for it is the ONLY way a real number that is not a
+    float can be rounded: `Fraction(7, 2)` and `Decimal("3.5")` both
+    define one and neither converts exactly to a double. A class with no
+    `__ceil__` falls through to the conversion below, which is where a plain
+    object is refused.
+    """
     if apy_is_int_like_of(v):
         return apy_whole_int(v)
     if apy_is_big_of(v):
         return v
+    if i64(load(i32, offset(v, apy_kind_offset()))) == apy_inst_kind():
+        got: ptr = apy_unary_dunder_of(v, rodata(b"__ceil__\0"))
+        if got:
+            return got
+        if apy_err_kind():
+            return ptr(0)
     x: f64 = apy_math_arg_of(v, rodata(b"ceil\0"))
     if apy_err_kind():
         return ptr(0)
@@ -241,11 +271,26 @@ def apy_math_ceil(v: ptr) -> ptr:
 
 
 def apy_math_trunc(v: ptr) -> ptr:
-    """`math.trunc(x)` -- toward zero, which is neither floor nor ceil."""
+    """`math.trunc(x)` -- toward zero, which is neither floor nor ceil.
+
+    PEP 3141'S HOOK COMES FIRST, before any float conversion. `floor`,
+    `ceil` and `trunc` are the three math functions with a dunder of their
+    own, and asking for it is the ONLY way a real number that is not a
+    float can be rounded: `Fraction(7, 2)` and `Decimal("3.5")` both
+    define one and neither converts exactly to a double. A class with no
+    `__trunc__` falls through to the conversion below, which is where a plain
+    object is refused.
+    """
     if apy_is_int_like_of(v):
         return apy_whole_int(v)
     if apy_is_big_of(v):
         return v
+    if i64(load(i32, offset(v, apy_kind_offset()))) == apy_inst_kind():
+        got: ptr = apy_unary_dunder_of(v, rodata(b"__trunc__\0"))
+        if got:
+            return got
+        if apy_err_kind():
+            return ptr(0)
     x: f64 = apy_math_arg_of(v, rodata(b"trunc\0"))
     if apy_err_kind():
         return ptr(0)
