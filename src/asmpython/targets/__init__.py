@@ -70,5 +70,49 @@ JVM = register(Target(
     stack_alignment=8, default_toolchain="jar",
 ), aliases=("java", "jar"))
 
+#: The host CPython interpreter, as a bytecode target. Not a machine either:
+#: like `jvm`, the "architecture" is a virtual machine's own instruction set
+#: (CPython's, this release's), and the "object format" is a `.pyc` --
+#: written whole by the `pybc` backend, not assembled from parts, which is
+#: why `default_toolchain` just names the file rather than invoking one.
+PYBC = register(Target(
+    "pybc", arch="cpython", os="cpython", abi="cpython",
+    object_format="pyc", object_suffix=".pyc", executable_suffix=".pyc",
+    stack_alignment=8, default_toolchain="pyc",
+), aliases=("pyc",))
+
+#: A REAL CPYTHON EXTENSION MODULE, not a program: `object_format="source"`
+#: because the `cpyext` backend emits C, same as `c` -- what makes these
+#: targets distinct is `abi="cpyext"`, which is what tells
+#: `CPyExtToolchain.supports()` to link with `-shared -fPIC` and the Python
+#: headers instead of building an executable. `executable_suffix` is the
+#: DEFAULT name only: CPython's own import machinery looks for the fuller
+#: ABI-tagged suffix (`importlib.machinery.EXTENSION_SUFFIXES[0]`, e.g.
+#: `.cpython-314-x86_64-linux-gnu.so`) to find a module by bare `import
+#: name` on `sys.path` -- `-o name.cpython-...-gnu.so` gets that; a plain
+#: `.so`/`.pyd` still loads correctly through
+#: `importlib.util.spec_from_file_location`, which is what every extension
+#: module in `tests/asmpython/unit/test_cpyext_backend.py` uses to avoid
+#: hard-coding the host's own tag into a test that runs on every host.
+X86_64_LINUX_CPYEXT = register(Target(
+    "x86_64-linux-cpyext", arch="x86_64", os="linux", abi="cpyext",
+    object_format="source", object_suffix=".c", executable_suffix=".so",
+    default_toolchain="cpyext",
+), aliases=("cpyext-linux", "cpyext"))
+
+#: THE ONE THIS SESSION CANNOT LINK: it needs a Windows-targeting C
+#: compiler (`x86_64-w64-mingw32-gcc`, MinGW-w64's cross toolchain) on
+#: PATH, which is not installed everywhere this compiler is. Registered
+#: and code-complete regardless -- `asmpython targets`/`asmpython backends`
+#: should show the whole matrix, and `CPyExtToolchain.link()` refuses with
+#: a named, installable tool rather than a traceback when it is missing,
+#: exactly like every other cross target here (`AARCH64_LINUX` et al.).
+X86_64_WINDOWS_CPYEXT = register(Target(
+    "x86_64-windows-cpyext", arch="x86_64", os="windows", abi="cpyext",
+    object_format="source", object_suffix=".c", executable_suffix=".pyd",
+    cc_names=("x86_64-w64-mingw32-gcc",), default_toolchain="cpyext",
+), aliases=("cpyext-windows", "pyd"))
+
 __all__ = ["PORTABLE_C", "X86_64_LINUX", "X86_64_WINDOWS", "X86_64_MACOS",
-           "AARCH64_NONE", "AARCH64_LINUX", "AARCH64_MACOS", "JVM"]
+           "AARCH64_NONE", "AARCH64_LINUX", "AARCH64_MACOS", "JVM", "PYBC",
+           "X86_64_LINUX_CPYEXT", "X86_64_WINDOWS_CPYEXT"]

@@ -1,12 +1,15 @@
 """The toolchains that ship with asmpython.
 
-All three are ordinary registrations. `cc` assembles and links through a C
-compiler driver; `jar` packages what a JVM backend emits; `none` exists so
-"emit the artifacts and stop" is a toolchain rather than a special case
-threaded through the driver.
+All ordinary registrations. `cc` assembles and links through a C compiler
+driver; `jar` packages what a JVM backend emits; `pyc` writes the `pybc`
+backend's single artifact under the right name; `cpyext` is `cc` again but
+`-shared -fPIC` against the Python headers, for a real CPython extension
+module; `none` exists so "emit the artifacts and stop" is a toolchain
+rather than a special case threaded through the driver.
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from .. import target as target_registry
@@ -153,6 +156,116 @@ class JarToolchain(Toolchain):
         return output
 
 
+class CPyExtToolchain(Toolchain):
+    """Compile and link a CPython extension module: `.so` on Linux, `.pyd`
+    on Windows.
+
+    Almost `CcToolchain` -- the same driver, the same "write artifacts,
+    then invoke it" shape -- but a `-shared -fPIC` build against the
+    Python headers is not something `cc prog.c -o prog` produces, and
+    bolting an `is_shared` branch onto `CcToolchain.link()` would make
+    every ordinary executable build carry a check for a flag it never
+    needs. A second, small toolchain reads as what it is instead.
+
+    THE HEADERS COME FROM `sysconfig`, not a `python3-config` subprocess:
+    this compiler is ALREADY RUNNING under the exact CPython whose C-API
+    the extension is built against (see `pybc/emit.py`'s docstring for the
+    same fact used the same way), so `sysconfig.get_paths()["include"]` is
+    not a guess about which Python -- it is the one asking.
+    """
+
+    name = "cpyext"
+    description = "compile and link a CPython extension module (.so/.pyd)"
+
+    def supports(self, target: Target) -> bool:
+        return target.object_format == "source" and target.abi == "cpyext"
+
+    def link(self, request: LinkRequest) -> Path:
+        import sysconfig
+
+        candidates = request.target.cc_names or CcToolchain.CANDIDATES
+        cc = find_tool(candidates, what=f"compiler for {request.target.name}",
+                       install="install a suitable C compiler and put it on "
+                               "PATH -- a Windows .pyd needs a Windows-"
+                               "targeting cross compiler such as MinGW-w64's "
+                               "x86_64-w64-mingw32-gcc, since it links "
+                               "against a Windows Python's import library")
+        work = request.workdir
+        work.mkdir(parents=True, exist_ok=True)
+
+        inputs: list[str] = []
+        for name, data in request.artifacts.items():
+            path = work / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            if path.suffix in _COMPILABLE:
+                inputs.append(str(path))
+        if not inputs:
+            raise LinkError(
+                "the cpyext backend produced nothing this toolchain can "
+                "compile",
+                detail="artifacts: " + (", ".join(request.artifacts) or "(none)"))
+
+        include_dir = sysconfig.get_paths()["include"]
+        argv = [cc, *inputs, "-shared", "-fPIC",
+                "-I", include_dir, "-o", str(request.output),
+                *request.extra_inputs]
+        if request.target.os == "windows":
+            # A WINDOWS .pyd LINKS AGAINST THE INTERPRETER'S IMPORT
+            # LIBRARY -- `PyInit_x` alone does not resolve `PyLong_*` et al.
+            # at load time the way a Linux .so's undefined symbols resolve
+            # against the process that dlopen'd it. `-fPIC` is a harmless
+            # no-op under MinGW (position independence is the default);
+            # left in rather than branched around, so the two platforms'
+            # argv differ only by what Windows genuinely needs more of.
+            libdir = sysconfig.get_config_var("installed_base") or ""
+            major, minor = sys.version_info[:2]
+            argv += ["-L", str(Path(libdir) / "libs"), f"-lpython{major}{minor}"]
+        run(request, argv, what="compiling and linking the extension module")
+        if not request.output.exists():
+            raise LinkError(f"{cc} reported success but wrote no "
+                            f"{request.output.name}")
+        return request.output
+
+
+class PycToolchain(Toolchain):
+    """Write the `pybc` backend's single `.pyc` artifact to the output path.
+
+    There is nothing to assemble or link -- a `.pyc` is one file, already
+    complete, and the only question is where it goes. `NoToolchain` would
+    write it under its own artifact name inside a directory; this instead
+    honours `-o`/the target's default naming the same way `cc` and `jar` do,
+    so `asmpython build prog.py --backend pybc` produces `prog.pyc` next to
+    `prog.py` like every other backend produces its own default output name.
+    """
+
+    name = "pyc"
+    description = "write the pybc backend's .pyc artifact to the output path"
+
+    def supports(self, target: Target) -> bool:
+        return target.object_format == "pyc"
+
+    def link(self, request: LinkRequest) -> Path:
+        pyc = [n for n in request.artifacts if n.endswith(".pyc")]
+        if len(pyc) != 1:
+            raise LinkError(
+                "the pyc toolchain expects exactly one .pyc artifact",
+                detail="artifacts: " + (", ".join(request.artifacts) or "(none)"),
+                help="this toolchain packages what the pybc backend emits; "
+                     "use --toolchain none to inspect raw artifacts instead")
+        if request.extra_inputs:
+            raise LinkError(
+                "the pyc toolchain takes no extra link inputs",
+                detail=", ".join(request.extra_inputs),
+                help="a .pyc has nothing to link against; a program that "
+                     "imports another module resolves it at run time")
+        output = request.output
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(request.artifacts[pyc[0]])
+        request.commands.append(["(write)", str(output)])
+        return output
+
+
 class NoToolchain(Toolchain):
     """Write the artifacts out and stop.
 
@@ -180,4 +293,6 @@ class NoToolchain(Toolchain):
 def load_builtin() -> None:
     register(CcToolchain())
     register(JarToolchain())
+    register(PycToolchain())
+    register(CPyExtToolchain())
     register(NoToolchain())

@@ -9,6 +9,8 @@ asmpython build prog.py                   # -> prog.exe, ready to run
 asmpython build prog.py -O                # optimise first
 asmpython build prog.py --backend x86-64 --target x86_64-linux
 asmpython build prog.py --backend jvm --java-version 21   # -> prog.jar
+asmpython build prog.py --backend pybc    # -> prog.pyc, `python prog.pyc` runs it
+asmpython build lib.py --backend cpyext --library   # -> lib.so/.pyd, `import lib`
 asmpython build prog.py --emit            # artifacts only; do not link
 asmpython build prog.py --emit-ir         # stop at the IR and read it
 asmpython run prog.py                     # execute in the reference interpreter
@@ -26,10 +28,12 @@ src/asmpython/
                  parser, interpreter
   passes/        pass manager with invariant checking, and transforms
   frontend(s)/   source -> IR         (python: the language, not a subset)
-  backend(s)/    IR -> artifacts      (c; x86-64; arm64; jvm -- and six
-                 more registered but unfinished: see `asmpython backends`)
-  target(s)/     the platforms        (x86_64-*, aarch64-*, c, jvm)
-  link/          artifacts -> program (cc; jar; baremetal; none)
+  backend(s)/    IR -> artifacts      (c; x86-64; arm64; jvm; pybc (.pyc);
+                 cpyext (a real CPython extension module, .so/.pyd) -- and
+                 five more registered but unfinished: see `asmpython backends`)
+  target(s)/     the platforms        (x86_64-*, aarch64-*, c, jvm, pybc,
+                 x86_64-{linux,windows}-cpyext)
+  link/          artifacts -> program (cc; jar; pyc; cpyext; baremetal; none)
   objects/       what a Python value IS at run time: the object runtime as C,
                  the part of it rewritten in IR, and the floor beneath both
   runtime/       that IR part's source, in asmpython's own machine subset --
@@ -172,9 +176,15 @@ reason to drop back to C.
 A **compiled extension module** — `.pyd`, `.so` — is not source and is refused
 with `E0129` naming the file and the distribution it came from, rather than
 `E0083` about a file that is plainly sitting right there. It is a native binary
-built against CPython's C API, so using one needs that API implemented against
-this object runtime; loading it is the smaller half, and `dynlib` in
-`objects/hostsvc.py` is that half.
+built against CPython's C API, so using a THIRD-PARTY one needs that API
+implemented against this object runtime; loading it is the smaller half, and
+`dynlib` in `objects/hostsvc.py` is that half. That is the LOAD direction. The
+EMIT direction — asmpython producing its own `.pyd`/`.so`, rather than
+consuming someone else's — is the `cpyext` backend, and does not need CPython's
+C-API implemented against this object runtime: it needs only enough of that
+API to convert values at the boundary, written once as hand-generated glue
+around the ordinary `c` backend's output. See `asmpython build --backend
+cpyext --library` and `backends/cpyext/emit.py`.
 
 ## Native libraries
 

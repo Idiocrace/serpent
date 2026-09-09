@@ -48,6 +48,7 @@ def _options(args) -> Options:
         source=Path(args.source),
         output=Path(args.output) if getattr(args, "output", None) else None,
         frontend=getattr(args, "frontend", None),
+        library=getattr(args, "library", False),
         backend=getattr(args, "backend", "c"),
         backend_options=dict(getattr(args, "backend_options", None) or {}),
         target=(target_registry.get(args.target)
@@ -686,6 +687,17 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--max-errors", type=int, default=100)
         p.add_argument("--werror", action="store_true",
                        help="treat warnings as errors")
+        # A LIBRARY HAS NO ENTRY AND IS NOT SUPPOSED TO. Every top-level
+        # `def` is exported instead of only `main`, and a module of nothing
+        # but definitions is not "nothing to run" (E0003) but the point.
+        # See `frontends/python/__init__.py`'s `library` parameter, which
+        # this is the one place that reaches -- this flag existed in the
+        # frontend before anything on the command line could ask for it.
+        p.add_argument("--library", action="store_true",
+                       help="compile definitions only, with no `main`; "
+                            "every top-level function is exported "
+                            "(needed to target `cpyext`, and useful with "
+                            "`run --entry` to call one function directly)")
 
     def pass_args(p):
         p.add_argument("-O", "--optimise", action="store_true",

@@ -18,6 +18,8 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass
 
+from ..diagnostics import is_real
+
 from ..ir import Module
 # Re-exported so a backend author needs one import. The TYPE belongs to the
 # backend interface -- every `emit` receives one -- but the INSTANCES do not
@@ -221,6 +223,33 @@ class Backend(abc.ABC):
         return f"<backend {self.name}>"
 
 
+def source_file_of(module: Module):
+    """The `SourceFile` the frontend parsed `module` from, or `None`.
+
+    `Module` carries no source text of its own -- `metadata["source"]` is a
+    display name, not the text -- but every instruction, function and global
+    the frontend produced was spanned against the file it came from, and a
+    span's `.file` is the real `SourceFile`, text included. Shared by any
+    backend that needs the ORIGINAL source rather than the IR: `pybc`, which
+    hands it to the host's own `compile()`, and `cpyext`, which re-parses it
+    to check a function's calling convention before exporting it.
+
+    Checking function/global spans before descending into every instruction
+    is just cheaper: most programs have one within the first few functions.
+    """
+    for fn in module.functions:
+        if is_real(fn.span):
+            return fn.span.file
+        for block in fn.blocks:
+            for instr in block.instructions:
+                if is_real(instr.span):
+                    return instr.span.file
+    for g in module.globals:
+        if is_real(g.span):
+            return g.span.file
+    return None
+
+
 _REGISTRY: dict[str, Backend] = {}
 
 
@@ -251,7 +280,7 @@ def load_builtin() -> None:
     # unfinished half marked, rather than showing four and leaving the rest to
     # be discovered as "unknown backend".
     from ..backends import (                                   # noqa: F401
-        apir, arm32, arm64, c, jvm, llvm, pybc, wasm, x86_32, x86_64,
+        apir, arm32, arm64, c, cpyext, jvm, llvm, pybc, wasm, x86_32, x86_64,
     )
 
 

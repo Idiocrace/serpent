@@ -48,6 +48,11 @@ class Options:
     source: Path
     output: Path | None = None
     frontend: str | None = None
+    #: Definitions only, no `main`, every top-level function exported. See
+    #: `frontends/python/__init__.py`'s `library` parameter -- this is the
+    #: one place the driver reaches it. Needed to target `cpyext`; also
+    #: useful with `run --entry` to call one function directly.
+    library: bool = False
     backend: str = "c"
     #: Values for the options the chosen backend declares, keyed by option name
     #: without the dashes -- {"class-version": "75"}. Not interpreted here: the
@@ -257,8 +262,25 @@ def compile_source(opts: Options, sink: DiagnosticSink) -> Result:
                   + "|".join(sorted(frontend_registry.available()))))
         return Result()
 
+    if opts.library:
+        # CHECKED BY SIGNATURE, NOT BY CALLING AND CATCHING: a frontend that
+        # has never heard of `library=` (nothing outside `frontends/python`
+        # has) should be told so cleanly, but wrapping the call itself in
+        # `except TypeError` would just as happily catch a genuine bug
+        # inside a frontend that DOES accept the argument, and report it as
+        # "not supported" instead of surfacing it.
+        import inspect
+        try:
+            inspect.signature(fe.compile).bind(source, sink, library=True)
+        except TypeError:
+            sink.report(
+                error("E9110",
+                      f"--library is not supported by the {fe.name!r} frontend"))
+            return Result()
+
     try:
-        module = fe.compile(source, sink)
+        module = (fe.compile(source, sink, library=True) if opts.library
+                 else fe.compile(source, sink))
     except RecursionError:
         # A long expression is a deep tree, and analysis and lowering both
         # walk it recursively. `1 + 2 + ... + 999` exhausted the interpreter

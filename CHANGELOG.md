@@ -48,6 +48,71 @@ deliverable.
   packages cannot share an import name, and the rewrite owns it; the old tree
   needs `PYTHONPATH=legacy`. See `legacy/README.md`.
 
+- **Full `.pyc` and `.pyd` support** — two new backends, both producing
+  artifacts a real, unmodified CPython can run without asmpython present.
+
+  **`pybc`** (`backends/pybc/`, target `pybc`, toolchain `pyc`) makes
+  `asmpython build prog.py --backend pybc` write a genuine `.pyc`:
+  PEP 552 header (magic number, bit field, source mtime/size) plus
+  `marshal.dumps` of a real code object, executable with a plain
+  `python prog.pyc`. It does not reimplement a CPython bytecode compiler
+  from the IR — recovering Python semantics out of `apy_*`-shaped IR calls
+  well enough to hand-write a second, correct bytecode emitter is real,
+  IR-wide work (a semantic tag on every object-runtime call, a role on
+  every global) that stays undone. Instead it recovers the ORIGINAL SOURCE
+  TEXT from the span the frontend already attaches to nearly every
+  instruction and hands it to the HOST's own `compile()`: since this
+  compiler already requires Python 3.14 to run at all (the frontend parses
+  with the host's `ast`), the host and the target are one interpreter by
+  construction, and no other bytecode compiler can promise not to drift
+  from it release to release. `--opt-level 0|1|2` reaches CPython's own
+  `-O`/`-OO`. Verified byte-identical to `compile()` + `marshal` under the
+  same filename; see `tests/asmpython/unit/test_pybc_backend.py`.
+
+  **`cpyext`** (`backends/cpyext/`, targets `x86_64-linux-cpyext` /
+  `x86_64-windows-cpyext`, toolchain `cpyext`) compiles a Python module into
+  a REAL CPython extension module — `.so` on Linux, `.pyd` on Windows —
+  loadable with an ordinary `import`, no shim process and no embedded
+  interpreter. The object runtime (`objects/c/`) has no refcounting or GC
+  and shares nothing with CPython's `PyObject` layout, so this does not
+  attempt to hand a raw `apy_obj *` to CPython's heap: the compiled
+  function's body still runs entirely inside asmpython's own arena, and
+  only the boundary is bridged, one generated trampoline per exported
+  function, converting real `PyObject*` arguments into fresh `apy_value`s
+  (`apy_from_int`, `apy_str_copy`, ...) and the single returned `apy_value`
+  back into a fresh, correctly-refcounted `PyObject*`
+  (`PyLong_FromLongLong`, `PyUnicode_FromStringAndSize`, ...) — `None`,
+  `bool`, `int`, `float`, `str` and `bytes` cross the boundary; a
+  `list`/`dict`/user object does not yet, and is refused at call time
+  rather than silently misconverted. Two calling conventions, matched to
+  the IR's own two: an untyped top-level function gets the generic,
+  boxed-`apy_value` trampoline; one whose parameters and return are all
+  annotated `int`/`float`/`bool` gets a trampoline with no `apy_*` call in
+  it at all, straight to and from C scalars. A function is exported only
+  if a re-parse of the recovered source confirms a plain positional
+  signature — no default, `*args`, `**kwargs`, keyword-only parameter or
+  decorator — so nothing is guessed at the boundary; everything skipped is
+  named in the refusal if nothing ends up exportable. `--library`
+  (`Options.library`, threaded into `frontends/python/__init__.py`'s
+  pre-existing but previously CLI-unreachable `library=` parameter) compiles
+  definitions only, with no `main` required, so a pure function library
+  needs no dummy entry point — genuinely useful on its own with `run
+  --entry`, and what makes a module with no `main` compile at all.
+  An asmpython-runtime exception crossing the boundary (division by zero,
+  a `TypeError` from `+`, ...) is read out of the runtime's sticky global
+  error state and re-raised as the correspondingly-named real Python
+  exception, not a generic failure. Verified against the running
+  interpreter, not just against the C it emits: built, linked with a real
+  `cc -shared -fPIC -I<the running interpreter's own include dir>`,
+  `import`ed (both explicitly and via a bare `import name` off `sys.path`
+  under CPython's own ABI-tagged suffix), and called — including after
+  deleting the original `.py`, to prove the loaded module is the compiled
+  artifact and not the source sitting next to it. See
+  `tests/asmpython/unit/test_cpyext_backend.py`. The Windows target is
+  code-complete (MinGW-w64's `x86_64-w64-mingw32-gcc`, linked against the
+  interpreter's import library) but unverified in this environment, which
+  has no Windows cross toolchain installed.
+
 - **Targets and linking are extension points.** Targets were three constants
   inside the backend interface in the new tree and seven modules inside
   `_compiler/` in the old one. Both are registries now, asked by name, so
