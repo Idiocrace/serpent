@@ -777,27 +777,29 @@ class Interpreter:
             callee = self.module.function(ins.sym)
             if callee is None:
                 raise Trap(f"call to unknown function {ins.sym!r}")
-            res = put(self._call(callee, [R[x] for x in ins.args]))
-            # See `_consume`: an argument register that is never read
-            # again after this call -- `apy_seq_push(lst, Foo(...))`'s
-            # freshly built `Foo(...)`, most of all -- otherwise sits
-            # incref'd by nothing but its OWN temp register until this
-            # frame tears down, which is exactly `put()`'s own COPY/STORE
-            # story but for "handed to a call" instead of "handed to a
-            # variable". AFTER `put()`, same reason as there: `self._call`
-            # may have returned the very handle one of these arguments
-            # held (an identity-shaped builtin), and `put()`'s own incref
-            # of the result has to land first.
-            for reg in ins.args:
-                self._consume(fr, reg)
-            return res
+            # NOT ROUTED THROUGH `_consume`, deliberately, even though a
+            # CALL argument that is never read again afterward has the
+            # same "phantom reference until frame teardown" story
+            # `Op.COPY`/`Op.STORE` do -- and once did retire it here.
+            # Reverted: `_consume`'s safety needs the CALLEE to incref
+            # anything it keeps, the way `_attr_store`/`_dict_set`/
+            # `_apy_seq_push` were fixed to. `apy_cell_set` (closures)
+            # was not one of the audited ones -- `def inner(): return
+            # captured` finalized `captured` the moment the closure
+            # captured it, before `inner` was ever called, because
+            # nothing in the cell-store path claimed a reference the way
+            # a list append now does. Two hundred more `apy_*` functions
+            # exist unaudited; retiring an argument here is only safe
+            # for the ones actually checked, and checking all of them
+            # was not -- so nothing here is retired early, and it goes
+            # back to waiting for frame teardown, the same as before
+            # this optimisation existed.
+            return put(self._call(callee, [R[x] for x in ins.args]))
         if op is Op.CALL_PTR:
             idx = int(a(0)) & ~_FUNC_TAG
-            res = put(self._call(self.module.functions[idx],
-                                 [R[x] for x in ins.args[1:]]))
-            for reg in ins.args:
-                self._consume(fr, reg)
-            return res
+            # See `Op.CALL`'s own comment -- not routed through `_consume`.
+            return put(self._call(self.module.functions[idx],
+                                  [R[x] for x in ins.args[1:]]))
 
         if op is Op.JUMP:
             return _Jump(ins.labels[0])
