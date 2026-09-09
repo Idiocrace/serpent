@@ -3110,11 +3110,9 @@ class DynamicLowering:
         # protected by their own `except` -- so without somewhere to go they
         # jumped straight to the ENCLOSING handler and skipped the `finally`
         # entirely. `try: raise / except: raise / finally: log()` lost its
-        # log line.
-        # MADE ONLY WHEN A HANDLER BODY ACTUALLY NEEDS IT. Creating the block
-        # up front left an empty one behind for every `try`/`finally` with no
-        # `except`, and the verifier rejects a block with no terminator.
-        rethrow = None
+        # log line. Each handler below gets its OWN such block now, rather
+        # than one shared for the whole `try` -- see the comment on
+        # `raise_exit` in the loop for why sharing it went wrong.
 
         self.b.switch_to(dispatch)
         for handler in node.handlers:
@@ -3162,14 +3160,26 @@ class DynamicLowering:
             # no error at all. The exception was silently swallowed and the
             # outer `except` never fired.
             self._handling.append(self._keep(caught))
-            # ONLY THE HANDLER BODY is redirected through the finally. The
-            # no-match arm below emits its own copy, and leaving this pushed
-            # across it sent that copy here too -- the `finally` ran twice for
-            # a `try`/`finally` with no `except` at all.
-            if node.finalbody:
-                if rethrow is None:
-                    rethrow = self.b.new_block("tryfinraise")
-                self.handlers.append(rethrow.label)
+            # THIS HANDLER'S OWN ABNORMAL EXIT. A `raise` in this body must
+            # restore `h.handling` to `was` before going anywhere else, the
+            # same as the fall-through path below does -- otherwise it stays
+            # set to `caught` past this handler FOREVER, because the jump
+            # `_dyn_check_forced` emits leaves straight from wherever the
+            # `raise` is, skipping the restore below entirely. Measured:
+            # `except ValueError: raise TypeError("x")` with no `finally` at
+            # all left `h.handling` holding the ValueError, and a wholly
+            # UNRELATED `raise` several statements later -- in a different
+            # `try` altogether -- inherited it as `__context__`.
+            #
+            # PER HANDLER, not shared across the ones in this `try`: each has
+            # its OWN `was`, and restoring the wrong one would swap which
+            # exception a later `raise` chains to rather than fix anything.
+            # `finally` (if any) runs on this same path, exactly as the
+            # fall-through copy below runs it on that one -- see this
+            # method's docstring on why it is duplicated per exit rather than
+            # shared through a jump target.
+            raise_exit = self.b.new_block("handlerraise")
+            self.handlers.append(raise_exit.label)
             self._dyn_stmts(handler.body)
             if handler.name and self.b.current.terminator is None:
                 # `except ... as e` DELETES `e` when the clause ends. CPython
@@ -3182,8 +3192,7 @@ class DynamicLowering:
                 # emitting into that block is invalid IR -- there is also
                 # nothing to delete, because nothing follows.
                 self._dyn_unbind(handler.name)
-            if node.finalbody:
-                self.handlers.pop()
+            self.handlers.pop()
             self._handling.pop()
             self.finallys.pop()
             if self.b.current.terminator is None:
@@ -3191,6 +3200,17 @@ class DynamicLowering:
                 self._dyn_finally(node)
                 if self.b.current.terminator is None:
                     self.b.jump(done)
+            resume = self.b.current
+            self.b.switch_to(raise_exit)
+            self.b.call(T.PTR, "apy_error_handling", [was()])
+            self._in_finally += 1
+            self._dyn_stmts(node.finalbody)
+            self._in_finally -= 1
+            if self.b.current.terminator is None:
+                self._dyn_check_forced()
+            if self.b.current.terminator is None:
+                self.b.jump(done)
+            self.b.switch_to(resume)
             if nxt is None:
                 break
             self.b.switch_to(nxt)
@@ -3208,27 +3228,6 @@ class DynamicLowering:
                 self._dyn_check_forced()
             if self.b.current.terminator is None:
                 self.b.jump(done)
-
-        if rethrow is not None:
-            # AFTER the for/else, not between them: an `if` in that gap takes
-            # the loop's `else` for its own, which silently turns "no handler
-            # matched" into "this statement has no finally".
-            resume = self.b.current
-            self.b.switch_to(rethrow)
-            self._in_finally += 1
-            self._dyn_stmts(node.finalbody)
-            self._in_finally -= 1
-            if self.b.current.terminator is None:
-                self._dyn_check_forced()
-            # `_dyn_check_forced` LEAVES NO TERMINATOR in the entry function
-            # with nothing enclosing it: there it emits `apy_fatal_if_error`,
-            # which stops the process when the flag is set and RETURNS when it
-            # is not. Inline that is fine -- the caller keeps emitting into
-            # the same block -- but this block ends here, so the
-            # no-error path needs somewhere to go.
-            if self.b.current.terminator is None:
-                self.b.jump(done)
-            self.b.switch_to(resume)
 
         self.b.switch_to(done)
 
