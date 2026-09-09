@@ -198,10 +198,21 @@ while the object is still in use:
   `ir/interpreter.py`'s `_interpreted` covers all of those at once, and
   `f(x); del x` finalizes exactly where CPython does. For the two hundred
   `apy_*` primitives it is true one at a time, and `_NON_RETAINING` holds
-  the ones actually read: `apy_is`, the three container stores, and the two
-  cell stores. `x.attr = v` is the notable absentee -- `apy_setattr` has a
-  descriptor branch and a `__setattr__` branch, so an attribute-held value
-  waits for frame teardown.
+  the ones actually read: `apy_is`, the three container stores, the two
+  cell stores, and `apy_setattr`.
+
+  `apy_setattr` WAS THE NOTABLE ABSENTEE AND IS NOW CERTIFIED, which is what
+  makes `h.child = Noisy(); h.child = None` finalize at the second store
+  rather than at frame teardown. Every branch was read: a `__setattr__`
+  override and a data descriptor's `__set__` are interpreted Python, which
+  the `_interpreted` argument already covers; an `Instance`, an `Exc`, a
+  `Class` and a `Func` all store through `_attr_store`, which increfs the
+  new value and decrefs the old; `C.__name__ = ...` writes a plain `str`,
+  which is never tracked. THE ONE SHAPE NOT CERTIFIED is a property whose
+  SETTER IS A NATIVE (`property(g).setter(some_builtin)`), which no program
+  is known to write: `_pin_for_native` increfs the value instead of
+  certifying the lambda, so that shape LEAKS rather than risking an early
+  finalize.
 * a value held only by a CLOSURE CELL. The cell counts its contents now (it
   had to, before a call argument could be retired at all), but a FUNCTION
   does not count its cells' deaths: a function's own handle count is not

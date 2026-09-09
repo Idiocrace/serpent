@@ -135,3 +135,81 @@ ref_inside_the_cycle()
 print("collected:", gc.collect() > 0)
 print("callback for a doomed ref fired:", len(inside))
 print("--- ref_inside_the_cycle done ---")
+
+
+# --- an ATTRIBUTE holds a counted reference, so clearing one finalizes ------
+#
+# `apy_setattr` is on `interpreter._NON_RETAINING` now, which is what retires
+# the temporary the store was handed. Without it every attribute-held value
+# waited for frame teardown -- late, and visible in exactly this shape.
+class Held:
+    def __init__(self, tag):
+        self.tag = tag
+
+    def __del__(self):
+        print("held gone:", self.tag)
+
+
+class Owner:
+    def __init__(self):
+        self.child = None
+
+
+class Guarded:
+    def __init__(self):
+        self._v = None
+
+    @property
+    def v(self):
+        return self._v
+
+    @v.setter
+    def v(self, value):
+        self._v = value
+
+
+def cleared():
+    o = Owner()
+    o.child = Held("cleared")
+    print("stored")
+    o.child = None
+    print("after clearing")
+
+
+cleared()
+print("--- cleared ---")
+
+
+def replaced():
+    o = Owner()
+    o.child = Held("first")
+    o.child = Held("second")
+    print("after replacing")
+
+
+replaced()
+print("--- replaced ---")
+
+
+def owner_dies():
+    o = Owner()
+    o.child = Held("cascade")
+    print("dropping the owner")
+    del o
+    print("owner dropped")
+
+
+owner_dies()
+print("--- cascade ---")
+
+
+def through_a_property():
+    g = Guarded()
+    g.v = Held("property")
+    print("stored through the setter")
+    g.v = None
+    print("cleared through the setter")
+
+
+through_a_property()
+print("--- property ---")

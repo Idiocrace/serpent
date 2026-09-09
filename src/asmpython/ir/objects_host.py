@@ -10848,6 +10848,27 @@ def _descr_write(h, d, obj, value, delete: bool = False):
     return None
 
 
+def _pin_for_native(h, who, value) -> None:
+    """Incref `value` when `who` is a HOST primitive rather than Python.
+
+    WHY THIS EXISTS AT ALL: `apy_setattr` is on `interpreter._NON_RETAINING`,
+    which certifies that every value reaching it is either counted or handed
+    to interpreted Python (which counts by construction -- see
+    `Interpreter._interpreted`). Every branch of `_apy_default_setattr` meets
+    one of those. A property whose SETTER IS A NATIVE is the single shape
+    that meets neither: the body is a host lambda this file cannot certify
+    one at a time, and if one of them retained the value uncounted, retiring
+    the caller's register would finalize something still reachable -- the one
+    direction the whole scheme refuses to be wrong in.
+
+    So the value is pinned instead. That LEAKS in a shape no program is
+    known to write (`property(g).setter(some_builtin)`), and leaking is the
+    allowed direction: late, never early.
+    """
+    if isinstance(who, Native):
+        h.incref(h._value(value))
+
+
 def _descr_set(h, d, obj, value):
     """1 when the descriptor took the write, -1 when it is not a data
     descriptor and the caller should store normally, 0 on failure."""
@@ -10857,12 +10878,14 @@ def _descr_set(h, d, obj, value):
         if d.set is None:
             h._fail("AttributeError", "can't set attribute")
             return 0
+        _pin_for_native(h, d.set, value)
         if _user(h, lambda: (h._invoke(d.set, [obj, value]), 1)[1]) == 0:
             return 0
         return 0 if h.err is not None else 1
     m = d.cls.find("__set__")
     if m is None:
         return -1
+    _pin_for_native(h, m, value)
     if _user(h, lambda: (h._invoke_obj(m.bind(d), [obj, value]), 1)[1]) == 0:
         return 0
     return 0 if h.err is not None else 1

@@ -1221,16 +1221,29 @@ _CMP = (Op.EQ, Op.NE, Op.LT, Op.LE, Op.GT, Op.GE)
 #:   what made retiring a call argument safe at all -- see
 #:   `Interpreter._interpreted`.
 #:
-#: `apy_setattr` is DELIBERATELY ABSENT even though `_attr_store` counts
-#: correctly: the primitive has several branches -- a data descriptor's
-#: setter, a `__setattr__` override, a `Class` writing a raw field -- and
-#: certifying "counted" means certifying all of them. An attribute-held
-#: value therefore finalizes at frame teardown rather than at the store,
-#: which is late, and late is allowed.
+#: - `apy_setattr` was the notable absentee and is now certified, branch
+#:   by branch, because `x.attr = v` is how a program hands a value to an
+#:   object and leaving it out made every attribute-held value finalize at
+#:   frame teardown instead of at the store. What the audit found:
+#:
+#:   * a `__setattr__` OVERRIDE calls interpreted Python, which counts its
+#:     parameters by construction -- the same argument `_interpreted`
+#:     makes for every ordinary call, made once for all of them;
+#:   * a DATA DESCRIPTOR's `__set__` is a user method, so the same
+#:     argument covers it -- except when the setter is a `Native`, which
+#:     no program is known to write and which `_pin_for_native`
+#:     (`ir/objects_host.py`) pins rather than certifies;
+#:   * an `Instance`, an `Exc`, a `Class` and a `Func` all store through
+#:     `_attr_store`, which increfs the new value and decrefs the old,
+#:     exactly as `_dict_set` does for a dict;
+#:   * `C.__name__ = ...` writes a plain `str` into a field, and a `str`
+#:     handle is never tracked at all;
+#:   * everything else raises without storing.
 _NON_RETAINING = frozenset({
     "apy_is",
     "apy_seq_push", "apy_set_add", "apy_dict_set",
     "apy_cell_new", "apy_cell_set",
+    "apy_setattr",
 })
 
 
