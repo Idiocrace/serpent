@@ -30,8 +30,13 @@ class Arm32Backend(Backend):
 
     def emit(self, module: Module, target: Target) -> dict[str, bytes]:
         raise BackendUnsupported(
-            "the arm32 backend is not written yet. What it needs: "
-            "an ARMv7 encoder and the ELF32 writer")
+            "the arm32 backend is not written yet. What it needs, in the "
+            "order the work has to happen: a target-width `ptr` in the IR "
+            "(`ir/types.py` fixes it at eight bytes) and an object runtime "
+            "that reads it, which is around 670 sites across 45 runtime "
+            "modules written with literal eight-byte offsets; then an ARMv7 "
+            "encoder -- a different instruction set from AArch64, not a "
+            "narrower one -- an AAPCS32 emitter, and the ELF32 writer")
 
 
 register(Arm32Backend())

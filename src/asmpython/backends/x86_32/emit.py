@@ -31,8 +31,13 @@ class X86_32Backend(Backend):
 
     def emit(self, module: Module, target: Target) -> dict[str, bytes]:
         raise BackendUnsupported(
-            "the x86-32 backend is not written yet. What it needs: "
-            "the x86-64 encoder, in 32-bit mode, plus the ELF32 and COFF writers")
+            "the x86-32 backend is not written yet. What it needs, in the "
+            "order the work has to happen: a target-width `ptr` in the IR "
+            "(`ir/types.py` fixes it at eight bytes) and an object runtime "
+            "that reads it, which is around 670 sites across 45 runtime "
+            "modules written with literal eight-byte offsets; then a 32-bit "
+            "mode in the x86-64 encoder, an i386 emitter for the cdecl "
+            "convention, and the ELF32 writer")
 
 
 register(X86_32Backend())

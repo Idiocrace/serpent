@@ -363,7 +363,8 @@ def _emit_parallel_moves(e: _Emitter, moves: list[tuple[str, str]]) -> None:
 
 class Arm64Backend(Backend):
     name = "arm64"
-    description = "AArch64 assembly (AAPCS64), shared allocator"
+    description = ("AArch64 machine code (AAPCS64): ELF objects directly, "
+                   "assembly for Mach-O until that writer exists")
     default_target = "aarch64-none"
 
     def symbol(self, name: str, dialect: AsmDialect) -> str:

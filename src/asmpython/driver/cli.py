@@ -43,16 +43,37 @@ def _sink(args) -> DiagnosticSink:
     )
 
 
+def _select(args) -> tuple[str, str | None]:
+    """The backend and target a `--backend`/`--bits`/`--target` triple names.
+
+    RESOLVED IN ONE PLACE so the three cannot be read in different orders by
+    different commands. A contradiction between them is a usage error and
+    exits saying which two disagree, rather than one silently winning.
+    """
+    from ..backend.families import (
+        SelectionError, resolve_backend, resolve_target,
+    )
+    name = getattr(args, "backend", "c")
+    bits = getattr(args, "bits", None)
+    named = getattr(args, "target", None)
+    try:
+        backend = resolve_backend(name, bits, None)
+        target = resolve_target(backend, bits, named, target_registry)
+    except SelectionError as exc:
+        raise SystemExit(f"asmpython: {exc}") from None
+    return backend, target
+
+
 def _options(args) -> Options:
+    backend, target_name = _select(args)
     return Options(
         source=Path(args.source),
         output=Path(args.output) if getattr(args, "output", None) else None,
         frontend=getattr(args, "frontend", None),
         library=getattr(args, "library", False),
-        backend=getattr(args, "backend", "c"),
+        backend=backend,
         backend_options=dict(getattr(args, "backend_options", None) or {}),
-        target=(target_registry.get(args.target)
-                if getattr(args, "target", None) else None),
+        target=(target_registry.get(target_name) if target_name else None),
         link=not getattr(args, "emit", False),
         toolchain=getattr(args, "toolchain", "cc"),
         link_inputs=tuple(getattr(args, "link_input", None) or ()),
@@ -247,6 +268,19 @@ def cmd_backends(args) -> int:
             print(f"  {'':<{width}}   {option.flag} {option.metavar}")
             for line in _wrap(option.help, 60):
                 print(f"  {'':<{width}}     {line}")
+    # THE FAMILIES AFTER THE BACKENDS, and marked as not being backends. They
+    # are selectable with --backend and are not code generators, so listing
+    # them among the others would make `asmpython backends` show six entries
+    # for four compilers; leaving them out entirely would hide a name the
+    # help text tells the user to type.
+    from ..backend.families import DEFAULT_BITS, FAMILIES
+    print()
+    print("  families -- select one with --backend and choose the width "
+          "with --bits:")
+    for family, members in sorted(FAMILIES.items()):
+        spelled = ", ".join(f"{bits}: {name}"
+                            for bits, name in sorted(members.items()))
+        print(f"  {family:<{width}} {spelled}   (default {DEFAULT_BITS})")
     return 0
 
 
@@ -721,7 +755,13 @@ def build_parser() -> argparse.ArgumentParser:
     source_args(b)
     pass_args(b)
     b.add_argument("-o", "--output")
-    b.add_argument("--backend", default="c")
+    b.add_argument("--backend", default="c",
+                   help="code generator, or a family: `x86` and `arm` pick "
+                        "their member from --bits")
+    b.add_argument("--bits", type=int, choices=(32, 64), default=None,
+                   help="word size to emit for. Selects within a backend "
+                        "family, and is checked against --backend and "
+                        "--target when those already imply one")
     b.add_argument("--target",
                    help="platform to emit for; see `asmpython targets`")
     b.add_argument("--emit", action="store_true",

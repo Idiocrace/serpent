@@ -8,6 +8,7 @@ another.
 asmpython build prog.py                   # -> prog.exe, ready to run
 asmpython build prog.py -O                # optimise first
 asmpython build prog.py --backend x86-64 --target x86_64-linux
+asmpython build prog.py --backend arm --bits 64   # a family; --bits picks the member
 asmpython build prog.py --backend jvm --java-version 21   # -> prog.jar
 asmpython build prog.py --backend pybc    # -> prog.pyc, `python prog.pyc` runs it
 asmpython build lib.py --backend cpyext --library   # -> lib.so/.pyd, `import lib`
@@ -28,9 +29,12 @@ src/asmpython/
                  parser, interpreter
   passes/        pass manager with invariant checking, and transforms
   frontend(s)/   source -> IR         (python: the language, not a subset)
-  backend(s)/    IR -> artifacts      (c; x86-64; arm64; jvm; pybc (.pyc);
-                 cpyext (a real CPython extension module, .so/.pyd) -- and
-                 five more registered but unfinished: see `asmpython backends`)
+  backend(s)/    IR -> artifacts      (c; x86-64 and arm64, which encode their
+                 own instructions and write ELF objects with no assembler in
+                 the path; jvm; pybc (.pyc); cpyext (a real CPython extension
+                 module, .so/.pyd) -- and five more registered but unfinished:
+                 see `asmpython backends`. `x86` and `arm` are families:
+                 --bits chooses the member)
   target(s)/     the platforms        (x86_64-*, aarch64-*, c, jvm, pybc,
                  x86_64-{linux,windows}-cpyext)
   link/          artifacts -> program (cc; jar; pyc; cpyext; baremetal; none)

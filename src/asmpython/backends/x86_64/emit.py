@@ -556,7 +556,8 @@ class _Emitter:
 
 class X86_64Backend(Backend):
     name = "x86-64"
-    description = "x86-64 assembly; ABI and dialect chosen by target"
+    description = ("x86-64 machine code: ELF objects directly, assembly "
+                   "for COFF and Mach-O until those writers exist")
     # The machine this is running on, not a platform fixed at
     # authoring time: `asmpython build --backend x86-64` on Windows used to
     # emit ELF directives and hand them to a COFF assembler.
