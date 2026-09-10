@@ -93,3 +93,41 @@ class Lazy:
 
 lazy = Lazy()
 print(lazy.value, lazy.value, lazy.built)
+
+
+# --- A NAME DEFINED TWICE IS REBINDING, and each definition is its own -----
+#
+# `@f.register` over two `def _`s is the idiom that makes this worth
+# supporting. A call between the two means the FIRST, which is why a rebound
+# name goes through the VALUE rather than a symbol picked at compile time --
+# and why both definitions take the value path even when both are annotated.
+def twice(x):
+    return "first-" + str(x)
+
+
+print(twice(1), twice(x=1))
+
+
+def twice(y):
+    return "second-" + str(y)
+
+
+print(twice(2), twice(y=2))
+try:
+    twice(x=2)
+except TypeError as exc:
+    print(exc)
+
+
+def typed(a: int) -> str:
+    return "typed-first"
+
+
+print(typed(1), sorted(typed.__annotations__))
+
+
+def typed(b: bool) -> float:
+    return 2.5
+
+
+print(typed(True), sorted(typed.__annotations__), typed(b=False))

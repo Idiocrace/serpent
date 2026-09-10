@@ -69,8 +69,11 @@ def apy_it_mode_offset() -> i64:
     return 40
 
 
-def apy_ga_origin_offset() -> i64:
-    return 8
+# `apy_ga_origin_offset` IS `runtime/alias.py`'S, not repeated here. Two
+# identical definitions of one name in the ported runtime are one definition
+# too many: the frontend reads a name defined twice as REBINDING, files the
+# earlier one aside and puts the later on the value path -- which is right for
+# a program and wrong for a runtime whose whole point is machine words.
 
 
 def apy_vw_dict_offset() -> i64:

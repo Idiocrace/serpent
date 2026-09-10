@@ -1509,7 +1509,30 @@ class Analyzer:
                 self.functions[key] = first
                 self.def_of_node[id(first.node)] = key
                 self.rebound.add(node.name)
-            self.functions[node.name] = self._signature(node)
+                self.functions[node.name] = self._signature(node)
+                # A REBOUND NAME IS A VALUE, and a value is an `apy_value`.
+                # The same rule a NESTED `def` follows and for the same
+                # reason: there is no way to hand a machine-word function to
+                # `apy_call`, and a call to a name defined twice has to go
+                # through the value -- it is the only thing that knows which
+                # definition has run. Annotations do not buy the static path
+                # here either.
+                #
+                # BOTH DEFINITIONS, not just the later one. Leaving the
+                # first on the static path gave the name no module storage
+                # to rebind, so a call after the second reached the FIRST
+                # signature: `f(y=1)` was refused over a parameter the `def`
+                # above it plainly names, and forcing the value form on top
+                # of a machine-word body handed `apy_call` an unboxed
+                # argument instead.
+                for one in (first, self.functions[node.name]):
+                    if not one.dynamic:
+                        one.dynamic = True
+                        one.ret = OBJ
+                        for p in one.params:
+                            p.type = OBJ
+            else:
+                self.functions[node.name] = self._signature(node)
             self.def_of_node[id(node)] = node.name
 
         # A module-level `def` or `class` BINDS A MODULE NAME, and now that
@@ -3690,6 +3713,21 @@ class Analyzer:
         just one nobody can see until `xs` exists.
         """
         if any(isinstance(a, ast.Starred) for a in node.args):
+            return
+        if name in self.rebound:
+            # A NAME THE MODULE DEFINES TWICE has no single signature to
+            # check against. `info` is the LAST definition, and a call
+            # written between the two means the FIRST -- so checking it here
+            # reported `f() got an unexpected keyword argument 'x'` about a
+            # call whose `x` is exactly what the definition above it names.
+            # A compile error for correct Python, which is worse than the
+            # wrong answer this check exists to prevent.
+            #
+            # THE RUNTIME ANSWERS IT INSTEAD, and it is already arranged to:
+            # `dynamic._dyn_call`'s `by_value` routes every call to a rebound
+            # name through the VALUE, which is whichever function has been
+            # bound by the time the call runs. A real mismatch is reported
+            # there, which is where CPython reports this shape too.
             return
         if info.kwarg is not None or any(kw.arg is None
                                          for kw in node.keywords):
