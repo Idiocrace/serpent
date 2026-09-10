@@ -56,6 +56,16 @@ GUARDS = {
     #: A COMPILER, not a JVM. Only the Java-interop tests need one, and only to
     #: build the API they then import -- nothing in asmpython calls javac.
     "javac": lambda: bool(shutil.which("javac")),
+    #: AN ASSEMBLER, to CHECK an encoder against and not to run one. The
+    #: encoders produce their own bytes; binutils is the second opinion that
+    #: makes a table of encodings trustworthy. A machine without it still
+    #: compiles -- it just cannot prove this file right.
+    "binutils": lambda: bool(shutil.which("as") and shutil.which("objcopy")),
+    #: A READER for what an object writer produced, which is the same second
+    #: opinion in the other direction: `readelf` decides what the sections and
+    #: symbols ACTUALLY say, rather than the writer being asked to confirm its
+    #: own layout.
+    "readelf": lambda: bool(shutil.which("readelf")),
 }
 
 

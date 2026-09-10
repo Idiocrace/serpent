@@ -16,9 +16,9 @@ because every test asks whether the program produced the right answer and the
 answer is right either way.
 
 So the check is on the ARTIFACT, not on the backend's own description of
-itself. `KNOWN_TEXT_EMITTERS` is the list of binary backends that still emit
-assembly; it is expected to shrink to empty, and a backend leaving it must
-also be removed from that list or `test_the_gap_list_is_not_stale` fails.
+itself. `KNOWN_TEXT_EMITTERS` is the list of backend-and-target pairs that
+still emit assembly; it is expected to shrink to empty, and a pair leaving it
+must also be removed from that list or `test_the_gap_list_is_not_stale` fails.
 """
 from __future__ import annotations
 
@@ -47,10 +47,38 @@ def main() -> int:
     return add(3, 4)
 """
 
-#: BINARY BACKENDS THAT STILL EMIT ASSEMBLY TEXT. Each is a backend that has
-#: not got an instruction encoder or an object writer yet, so it stops at
-#: `.s` and lets `as` finish. THIS LIST MUST ONLY EVER SHRINK.
-KNOWN_TEXT_EMITTERS = {"x86-64", "arm64"}
+#: BINARY BACKEND AND TARGET PAIRS THAT STILL EMIT ASSEMBLY TEXT. Each is a
+#: combination with no instruction encoder or no object writer yet, so it stops
+#: at `.s` and lets `as` finish. THIS LIST MUST ONLY EVER SHRINK.
+#:
+#: KEYED BY TARGET AND NOT BY BACKEND, because an encoder arrives before the
+#: object writers do: x86-64 encodes its own instructions and writes ELF, and
+#: still has no COFF or Mach-O writer to put them in. Keyed by backend alone,
+#: removing it would claim a completeness it does not have on Windows, and
+#: keeping it would deny the ELF path that works.
+KNOWN_TEXT_EMITTERS = {
+    ("x86-64", "x86_64-macos"), ("x86-64", "x86_64-windows"),
+    ("arm64", "aarch64-linux"), ("arm64", "aarch64-macos"),
+    ("arm64", "aarch64-none"),
+}
+
+
+def _machine_targets(backend: str) -> list[str]:
+    """Every registered target this binary backend is expected to serve.
+
+    MATCHED ON ARCHITECTURE, which is what decides whether a code generator
+    applies at all: the x86-64 backend serves each x86_64 target and no other.
+    A source target is excluded even when the arch matches -- `cpyext` emits C
+    through a different backend entirely.
+    """
+    arch = {"x86-64": "x86_64", "x86-32": "x86", "arm64": "aarch64",
+            "arm32": "arm", "jvm": "jvm", "pybc": "cpython"}.get(backend)
+    if arch is None:
+        return []
+    return sorted(n for n in target_registry.available()
+                  if target_registry.get(n).arch == arch
+                  and not target_registry.get(n).is_source)
+
 
 #: What a LANGUAGE backend is allowed to name its output.
 TEXT_SUFFIXES = (".c", ".h", ".ll", ".wat")
@@ -60,19 +88,27 @@ TEXT_SUFFIXES = (".c", ".h", ".ll", ".wat")
 CODE_SUFFIXES = (".c", ".h", ".ll", ".wat", ".s", ".asm", ".S")
 
 
-def _artifacts(backend: str) -> dict[str, bytes]:
+def _artifacts(backend: str, target: str | None = None) -> dict[str, bytes]:
     be = backend_registry.get(backend)
-    target = target_registry.get(be.default_target)
+    chosen = target_registry.get(target or be.default_target)
     import tempfile
     import pathlib
     with tempfile.TemporaryDirectory() as tmp:
         path = pathlib.Path(tmp) / "prog.py"
         path.write_text(SOURCE, encoding="utf-8")
         result = compile_source(
-            Options(source=path, backend=backend, target=target),
+            Options(source=path, backend=backend, target=chosen),
             DiagnosticSink())
-        assert result.ok, f"{backend} did not compile"
+        assert result.ok, f"{backend} did not compile for {chosen.name}"
         return dict(result.artifacts)
+
+
+#: EVERY BINARY BACKEND AND TARGET IT SERVES, one case each. Built here rather
+#: than in the decorator so the two tests below partition the same list and
+#: cannot disagree about what the whole set is.
+BINARY_PAIRS = [(b, t) for b in READY
+                if backend_registry.get(b).kind == "binary"
+                for t in _machine_targets(b)]
 
 
 def _looks_like_text(data: bytes) -> bool:
@@ -108,10 +144,9 @@ class TestLanguageBackendsEmitSource:
 
 
 class TestBinaryBackendsEmitBytes:
-    @harness.cases("backend", [b for b in READY
-                               if backend_registry.get(b).kind == "binary"
-                               and b not in KNOWN_TEXT_EMITTERS])
-    def test_the_artifact_is_not_text(self, backend):
+    @harness.cases("backend, target",
+                   [p for p in BINARY_PAIRS if p not in KNOWN_TEXT_EMITTERS])
+    def test_the_artifact_is_not_text(self, backend, target):
         """The claim `kind = "binary"` makes, checked against the bytes.
 
         TWO CHECKS, because "no text at all" is the wrong rule. A jar carries
@@ -120,32 +155,46 @@ class TestBinaryBackendsEmitBytes:
         is SOURCE OR ASSEMBLY, and it must emit at least one thing that really
         is bytes; a backend passing only the first check could emit nothing.
         """
-        artifacts = _artifacts(backend)
+        artifacts = _artifacts(backend, target)
         for name in artifacts:
             assert not name.endswith(CODE_SUFFIXES), (
-                f"{backend}/{name} is source or assembly; a binary backend "
-                f"must encode its own output rather than leave it to `as`")
+                f"{backend}/{target}/{name} is source or assembly; a binary "
+                f"backend must encode its own output rather than leave it "
+                f"to `as`")
         assert any(not _looks_like_text(d) for d in artifacts.values()), (
-            f"{backend} emitted nothing binary: {sorted(artifacts)}")
+            f"{backend} on {target} emitted nothing binary: "
+            f"{sorted(artifacts)}")
 
-    @harness.cases("backend", sorted(KNOWN_TEXT_EMITTERS))
-    def test_the_gap_list_is_not_stale(self, backend):
-        """A backend that has grown an encoder must LEAVE the list.
+    @harness.cases("backend, target", sorted(KNOWN_TEXT_EMITTERS))
+    def test_the_gap_list_is_not_stale(self, backend, target):
+        """A pair that has grown an encoder must LEAVE the list.
 
         Otherwise the list stops describing anything and starts being a place
         where exemptions accumulate -- which is how a known gap becomes a
         permanent one.
         """
-        emitted = _artifacts(backend)
+        emitted = _artifacts(backend, target)
         assert any(n.endswith(CODE_SUFFIXES) for n in emitted), (
-            f"{backend} no longer emits text -- remove it from "
-            f"KNOWN_TEXT_EMITTERS")
+            f"{backend} on {target} no longer emits text -- remove the pair "
+            f"from KNOWN_TEXT_EMITTERS")
 
-    def test_the_gap_is_only_the_two_machine_backends(self):
+    def test_the_gap_is_only_the_machine_backends(self):
         """Nothing may be ADDED to the list without this test being edited."""
-        assert KNOWN_TEXT_EMITTERS == {"x86-64", "arm64"}
-        for backend in KNOWN_TEXT_EMITTERS:
-            assert backend in BACKENDS, f"{backend} is not a backend any more"
+        assert KNOWN_TEXT_EMITTERS <= set(BINARY_PAIRS), (
+            "the gap list names a backend and target pair that does not exist")
+        assert {b for b, _ in KNOWN_TEXT_EMITTERS} <= {"x86-64", "arm64"}
+
+    def test_x86_64_writes_its_own_elf(self):
+        """The pair that LEFT the list, asserted rather than merely absent.
+
+        A pair silently dropped from the gap list and from `BINARY_PAIRS` --
+        by a target being renamed, say -- would leave nothing testing it, and
+        the suite would go quiet about the one path that works.
+        """
+        artifacts = _artifacts("x86-64", "x86_64-linux")
+        (name, data), = artifacts.items()
+        assert name.endswith(".o"), name
+        assert data[:4] == b"\x7fELF", "not an ELF object"
 
 
 class TestAnUnfinishedBackendRefuses:

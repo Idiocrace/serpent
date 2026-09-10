@@ -684,13 +684,20 @@ class TestAgreement:
 
     @harness.needs("cc")
     def test_x86_64_backend_matches_cpython(self, name, tmp_path):
-        """Assemble the generated assembly and run it.
+        """Link what the backend emitted and run it.
 
         This is the path that caught a real miscompilation: a loop counter
         passed as a call argument and read afterwards was placed in a
         caller-saved register, so the call destroyed it and the loop ended
         early. The interpreter was right, the backend was wrong, and only
         running both revealed which.
+
+        ON AN ELF TARGET THE ARTIFACT IS AN OBJECT, so this now also runs the
+        instruction encoder over thirty-one whole programs rather than one
+        line at a time -- and a wrong ModRM byte in a form `test_x86_encode`
+        does not list shows up as a program printing the wrong number. Taking
+        the artifact under whatever name the backend chose is what lets the
+        same test serve both, rather than a second copy for the object path.
         """
         from asmpython.backend import get, load_builtin
         from asmpython.backends.x86_64.emit import UnsupportedOperation
@@ -704,12 +711,13 @@ class TestAgreement:
         module.function("main").name = "main_ir"
         target = get_target(_HOST_TARGET_NAME)
         try:
-            asm = get("x86-64").emit(module, target)["out.s"]
+            artifacts = get("x86-64").emit(module, target)
         except UnsupportedOperation as exc:
             harness.skip(f"backend does not implement this yet: {exc}")
 
-        s_file = tmp_path / "out.s"
-        s_file.write_bytes(asm)
+        (filename, code), = artifacts.items()
+        emitted = tmp_path / filename
+        emitted.write_bytes(code)
         rt = tmp_path / "rt.c"
         rt.write_text(_runtime_c("main_ir", module), encoding="utf-8")
         exe = tmp_path / "out.exe"
@@ -717,7 +725,7 @@ class TestAgreement:
         # unconditionally, needed on every ELF host -- see toolchains.py.
         system_libs = [] if sys.platform == "win32" else ["-lm", "-ldl"]
         built = subprocess.run(
-            [HAS_CC, str(s_file), str(rt), "-o", str(exe), *system_libs],
+            [HAS_CC, str(emitted), str(rt), "-o", str(exe), *system_libs],
             capture_output=True, text=True)
         assert built.returncode == 0, built.stderr
         ran = subprocess.run([str(exe)], capture_output=True, text=True)
