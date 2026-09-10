@@ -3596,8 +3596,15 @@ class Analyzer:
             if allowed is not None:
                 # These are keywords, not positional, so the positional count
                 # is unaffected by them.
+                #
+                # A `**` SPLAT NAMES NOTHING HERE. `sorted(xs, **opts)` has
+                # one keyword whose `arg` is None, and checking that against
+                # the allowed list refused a call CPython accepts, naming
+                # `None` as the offending keyword. Which names the dict holds
+                # is a run-time question, and the lowering reads them out of
+                # it -- see `dynamic._KEYWORD_THUNKS`.
                 for kw in node.keywords:
-                    if kw.arg not in allowed:
+                    if kw.arg is not None and kw.arg not in allowed:
                         self._error("E0068",
                                     f"{name}() got an unexpected keyword "
                                     f"argument {kw.arg!r}", node)

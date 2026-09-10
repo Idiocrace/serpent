@@ -268,6 +268,21 @@ _VARIADIC_THUNKS = {
     "print": "apy_print_seq", "dict": "apy_dict_of", "bytes": "apy_bytes_of",
 }
 
+#: The builtins whose VALUE FORM has to carry `**kw`.
+#:
+#: A builtin reached as a value becomes a synthesised thunk whose body is the
+#: call the frontend would have emitted -- see `_dyn_builtin_value` -- and a
+#: thunk with no keyword parameter has nowhere to put the caller's keywords,
+#: so it DROPPED THEM SILENTLY: `forward(dict, a=1)` answered `{}` and
+#: `forward(sorted, xs, reverse=True)` ignored the reversal. Both are wrong
+#: answers with nothing to mark them.
+#:
+#: A DECLARED SET rather than every builtin, and deliberately so: giving a
+#: thunk keywords its own lowering does not expect could turn a call that
+#: works today into an error, so a name joins this list only once its answer
+#: has been checked against CPython.
+_KEYWORD_THUNKS = frozenset({"dict", "sorted", "min", "max"})
+
 
 class _TypeParams(ast.NodeTransformer):
     """Replace a type parameter's name with the object it stands for.
@@ -1209,16 +1224,22 @@ class DynamicLowering:
         code = self.b.reg(T.PTR)
         self.b.emit(Instruction(Op.FUNC_ADDR, T.PTR, dst=code, sym=symbol))
         variadic = 1 if name in _VARIADIC_THUNKS else 0
+        takes_kw = 1 if name in _KEYWORD_THUNKS else 0
         # ONE OPTIONAL PARAMETER for the types whose zero-argument form is
         # legal, so `defaultdict(list)` can call the value with nothing.
         optional = 1 if (name in _EMPTY_DEFAULTS
                          and name not in _VARIADIC_THUNKS) else 0
         made = self.b.call(T.PTR, "apy_func_new",
-                           [code, self.b.const(T.I64, 1),
+                           [code, self.b.const(T.I64, 1 + takes_kw),
                             self._dyn_str_literal(name),
                             self.b.const(T.I64, 0),
                             self.b.const(T.I64, optional),
                             self.b.const(T.I64, variadic)])
+        if takes_kw:
+            # THE `**kw` SLOT, declared so `_invoke_obj` fills it rather than
+            # dropping what the caller could not place. See `_KEYWORD_THUNKS`.
+            self.b.call(T.PTR, "apy_func_kwarg",
+                        [made, self.b.const(T.I64, 1)])
         if optional:
             self.b.call(T.PTR, "apy_func_default",
                         [made, self.b.const(T.I64, 0),
@@ -1281,6 +1302,10 @@ class DynamicLowering:
             fn.params.append(env)
             arg = fn.new_register(T.PTR)
             fn.params.append(arg)
+            kwbag = None
+            if name in _KEYWORD_THUNKS:
+                kwbag = fn.new_register(T.PTR)
+                fn.params.append(kwbag)
             saved_b, saved_info = self.b, self.info
             saved_handlers, self.handlers = self.handlers, []
             saved_finallys, self.finallys = self.finallys, []
@@ -1295,7 +1320,14 @@ class DynamicLowering:
             if name in _VARIADIC_THUNKS:
                 # The single parameter IS the `*rest` tuple the caller built,
                 # so the body is one call that takes it whole.
-                self.b.ret(self.b.call(T.PTR, _VARIADIC_THUNKS[name], [arg]))
+                _out = self.b.call(T.PTR, _VARIADIC_THUNKS[name], [arg])
+                if kwbag is not None:
+                    # `dict(*rest, **kw)`: the positional half first, the
+                    # keywords over the top of it, which is the order
+                    # `_dyn_call`'s own `dict` branch uses for the written
+                    # spelling. One rule, two ways of reaching it.
+                    self.b.call(T.PTR, "apy_update", [_out, kwbag])
+                self.b.ret(_out)
                 self.module.functions.append(fn)
                 self.b, self.info = saved_b, saved_info
                 self.handlers, self.finallys = saved_handlers, saved_finallys
@@ -1308,8 +1340,11 @@ class DynamicLowering:
                                         ctx=_ast.Load()),
                     args=[], keywords=[])
             else:
-                call = _ast.Call(func=_ast.Name(id=name, ctx=_ast.Load()),
-                                 args=[_Given(arg)], keywords=[])
+                call = _ast.Call(
+                    func=_ast.Name(id=name, ctx=_ast.Load()),
+                    args=[_Given(arg)],
+                    keywords=([_ast.keyword(arg=None, value=_Given(kwbag))]
+                              if kwbag is not None else []))
             for node in _ast.walk(call):
                 node.lineno = node.end_lineno = 1
                 node.col_offset = node.end_col_offset = 0
@@ -2025,7 +2060,15 @@ class DynamicLowering:
             # and only the runtime knows which those are.
             or (info is not None and info.kwarg)
             # `f(**d)` names its keywords with a dict that exists at run time.
-            or any(kw.arg is None for kw in node.keywords)
+            #
+            # UNLESS THIS IS THAT BUILTIN'S OWN THUNK. A value form built by
+            # `_dyn_builtin_value` for a name on `_KEYWORD_THUNKS` has a body
+            # of exactly this shape -- `sorted(x, **kw)` -- and routing it to
+            # the callable-value path made the thunk call ITSELF, for ever.
+            # `_raw_builtin` is what says "we are lowering the way out of
+            # that recursion", and it is why the guard exists at all.
+            or (any(kw.arg is None for kw in node.keywords)
+                and name != self._raw_builtin)
             # A NAME THE MODULE DEFINES TWICE means whichever `def` has run,
             # and which that is depends on where the call sits. The direct
             # path picks one at compile time, so a call written between the
@@ -2087,14 +2130,34 @@ class DynamicLowering:
             # `key=` and `reverse=`. Passed as VALUES rather than folded in,
             # so a key function is called once per element by the runtime --
             # which is where the element ordering lives.
+            #
+            # A `**` SPLAT IS READ AT RUN TIME. `sorted(xs, **opts)` -- and
+            # the value form of `sorted`, whose whole argument list arrives
+            # that way -- names nothing at compile time, so the two keywords
+            # are pulled out of the dict with their defaults. A NAMED keyword
+            # still wins over one the splat brought, which is what
+            # `sorted(xs, **opts, reverse=True)` means.
             kw = {k.arg: k.value for k in node.keywords if k.arg}
-            keyfn = (self._dyn_expr(kw["key"]) if "key" in kw
-                     else self.b.call(T.PTR, "apy_none", []))
+            bag = [k.value for k in node.keywords if k.arg is None]
+            spread = self._dyn_expr(bag[0]) if bag else None
+
+            def _from_kw(what: str, fallback):
+                if what in kw:
+                    return self._dyn_expr(kw[what])
+                if spread is not None:
+                    return self.b.call(
+                        T.PTR, "apy_dict_get_or",
+                        [spread, self._dyn_str_literal(what), fallback()])
+                return fallback()
+
+            keyfn = _from_kw("key",
+                             lambda: self.b.call(T.PTR, "apy_none", []))
             seq = self._dyn_expr(node.args[0])
             if name == "sorted":
-                rev = (self._dyn_expr(kw["reverse"]) if "reverse" in kw
-                       else self.b.call(T.PTR, "apy_from_bool",
-                                        [self.b.const(T.I64, 0)]))
+                rev = _from_kw("reverse",
+                               lambda: self.b.call(
+                                   T.PTR, "apy_from_bool",
+                                   [self.b.const(T.I64, 0)]))
                 out = self.b.call(T.PTR, "apy_sorted_by", [seq, keyfn, rev])
             else:
                 out = self.b.call(T.PTR, f"apy_{name}_by", [seq, keyfn])

@@ -244,3 +244,33 @@ print(operator.__contains__([1, 2, 3], 2) == operator.contains([1, 2, 3], 2))
 print(operator.__iadd__(2, 3) == operator.iadd(2, 3))
 print(operator.__concat__([1], [2]) == operator.concat([1], [2]))
 print(operator.__call__(str.upper, "z") == operator.call(str.upper, "z"))
+
+# A BUILTIN REACHED AS A VALUE CARRIES ITS KEYWORDS. The value form is a
+# synthesised thunk whose body is the call the frontend would have emitted,
+# and a thunk with no keyword slot dropped them SILENTLY -- `forward(dict,
+# a=1)` answered `{}` and `forward(sorted, xs, reverse=True)` ignored the
+# reversal. Both are wrong answers with nothing to mark them.
+def forward(fn, *args, **kw):
+    return fn(*args, **kw)
+
+
+rows = [("b", 2), ("a", 3), ("c", 1)]
+print(forward(dict, a=1, b=2))
+print(forward(dict, rows))
+print(forward(dict, rows, z=9))
+print(forward(dict))
+print(forward(sorted, [3, 1, 2]))
+print(forward(sorted, [3, 1, 2], reverse=True))
+print(forward(sorted, rows, key=lambda r: r[1]))
+print(forward(sorted, rows, key=lambda r: r[1], reverse=True))
+print(forward(min, rows, key=lambda r: r[1]),
+      forward(max, rows, key=lambda r: r[1]))
+
+# AND A `**` SPLAT WRITTEN OUT names its keywords at run time, which the
+# analysis pass used to refuse by naming `None` as the offending keyword.
+opts = {"reverse": True}
+print(sorted([3, 1, 2], **opts))
+print(sorted([3, 1, 2], **opts, key=lambda v: -v))
+print(dict(rows, **{"q": 5}))
+maker = dict
+print(maker(a=1), maker(rows), maker(rows, a=1))

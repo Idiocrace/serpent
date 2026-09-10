@@ -100,15 +100,18 @@ FIXED: `frontends/python/dynamic.py` now builds the positional half of any
 `dict(...)` and applies the keywords to it, in every shape, which is why
 `_TypedDictMeta.__call__` below can write `dict(*args, **kwargs)` plainly.
 
-WHAT REMAINS is `dict` reached as a VALUE -- `forward(dict, a=1)`, where the
-callee is a parameter. `_apy_call_spread_kw` (`ir/objects_host.py`) threads
-the caller's leftover keywords through as `kwrest` only for a `Func` or
-`Class` callee; `_invoke_obj`'s `Native` branch calls `f.body(*given)` and
-never reads `kwrest` at all. A plain user function forwarding the same
-`*args, **kwargs` to ANOTHER USER FUNCTION is unaffected -- only a builtin
-reached this way loses them, and it loses them SILENTLY, which is the part
-worth naming. Nothing in this module needs it, and the fix belongs in
-`_invoke_obj`'s `Native` case for every bundled module rather than here.
+THE VALUE FORM IS FIXED TOO. `forward(dict, a=1)`, where the callee is a
+parameter, reaches a SYNTHESISED THUNK -- `dynamic._dyn_builtin_value` --
+whose body is the call the frontend would have emitted, and a thunk with no
+keyword slot had nowhere to put them: it answered `{}`, silently.
+`_KEYWORD_THUNKS` names the builtins whose value form declares `**kw`, and
+the four on it (`dict`, `sorted`, `min`, `max`) now carry their keywords.
+
+A DECLARED SET RATHER THAN ALL OF THEM, deliberately: handing a thunk
+keywords its own lowering does not expect could turn a call that works today
+into an error, so a name joins that list only once its answer has been
+checked against CPython. A builtin outside it still drops them, and that is
+what to widen next.
 
 ## `get_origin`/`get_args` and a user `Generic[T]` subscript
 
