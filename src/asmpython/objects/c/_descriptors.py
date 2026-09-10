@@ -137,6 +137,41 @@ APY_API apy_value apy_getattr(apy_value obj, apy_value name) {
     return apy_default_getattr(obj, name);
 }
 
+/* Is `name` DECLARED in this class's `__slots__`, or in an ancestor's?
+
+   NOT `apy_slot_allows`, which answers a DIFFERENT QUESTION and was asked
+   here by mistake: that one says whether an INSTANCE may carry this
+   attribute at all, and it answers yes for every name the moment one class
+   in the chain omits `__slots__` -- which is right for a write and wrong for
+   this. The effect was that a class declaring `__slots__ = ()` and
+   inheriting from one that does not answered a `member_descriptor` for EVERY
+   name it did not define itself, including methods reached through its
+   METACLASS: `WithSlots.__subclasscheck__` came back as a descriptor and
+   `isinstance(x, WithSlots)` died with `'member_descriptor' object is not
+   callable`. `os.PathLike` is exactly that shape, so PEP 519 passed in the
+   interpreter and failed compiled. */
+static int apy_slot_declares(apy_value cls, apy_value name) {
+    apy_value here = cls;
+    int64_t at, i, n;
+    while (here && O(here)->kind == APY_TYPE_K) {
+        at = apy_dict_find(O(here)->v.t.dict, apy_name("__slots__"));
+        if (at >= 0) {
+            apy_value names = O(O(here)->v.t.dict)->v.d.vals[at];
+            /* A BARE STRING IS ONE SLOT, not a run of one-character ones. */
+            if (O(names)->kind == APY_STR_K) {
+                if (apy_eq_raw(names, name)) return 1;
+            } else {
+                n = apy_raw_len(names);
+                if (apy_error_occurred()) { apy_error_clear(); n = 0; }
+                for (i = 0; i < n; i++)
+                    if (apy_eq_raw(apy_key_at(names, i), name)) return 1;
+            }
+        }
+        here = O(here)->v.t.base;
+    }
+    return 0;
+}
+
 APY_API apy_value apy_default_getattr(apy_value obj, apy_value name) {
     const char *want = APY_CSTR(name);
     switch (O(obj)->kind) {
@@ -265,10 +300,8 @@ APY_API apy_value apy_default_getattr(apy_value obj, apy_value name) {
         /* A SLOT NAME reached through the class is a descriptor, not a
            missing attribute: `__slots__` declares storage, and the class dict
            holds nothing for it. */
-        if (apy_slot_allows(obj, name)
-                && apy_dict_find(O(obj)->v.t.dict, name) < 0
-                && apy_dict_find(O(obj)->v.t.dict,
-                                 apy_name("__slots__")) >= 0)
+        if (apy_dict_find(O(obj)->v.t.dict, name) < 0
+                && apy_slot_declares(obj, name))
             return apy_member_descriptor();
         /* THE HIERARCHY, as a program reads it back. `object` is the root
            of every chain even though no class links to it -- see

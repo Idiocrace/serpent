@@ -6987,12 +6987,14 @@ def _apy_default_getattr(h, a):
         # A SLOT NAME reached through the class is a DESCRIPTOR, not a
         # missing attribute: `__slots__` declares storage, and the class dict
         # holds nothing for it.
-        _slots = obj.dict.get("__slots__")
-        if _slots is not None and name not in obj.dict:
-            _names = [_slots] if isinstance(_slots, str) else list(_slots)
-            if name in _names:
-                return h._new(Instance(
-                    h._member_descriptor_class(), h))
+        #
+        # THE WHOLE CHAIN, not this class's own `__slots__` alone: a slot
+        # declared on a BASE is inherited through the MRO, so `Sub.held` for
+        # a `held` declared on `Base` answers the descriptor in CPython and
+        # answered None here -- while the C, which walks, answered the
+        # descriptor. Two runtimes disagreeing about one class attribute.
+        if name not in obj.dict and _slot_declares(obj, name):
+            return h._new(Instance(h._member_descriptor_class(), h))
         # THE HIERARCHY, as a program reads it back. `object` is the root
         # of every chain even though no class links to it, so a class with no
         # written base still has one base and only `object` itself has none.
@@ -7458,6 +7460,33 @@ def _apy_setattr(h, a):
             "__setattr__", str(h._get(a[1], "apy_setattr")),
             h._get(a[2], "apy_setattr"))))
     return _apy_default_setattr(h, a)
+
+
+def _slot_declares(cls, name: str) -> bool:
+    """Is `name` DECLARED in this class's `__slots__`, or an ancestor's?
+
+    NOT `_slot_allows`, which answers a DIFFERENT QUESTION: that one says
+    whether an INSTANCE may carry this attribute at all, and answers yes for
+    every name the moment one class in the chain omits `__slots__`. Right for
+    a write, wrong for deciding whether reading the name off the CLASS gives
+    a `member_descriptor`. See `objects/c/_descriptors.py`'s
+    `apy_slot_declares`, which is the same walk and was the same mistake.
+    """
+    here = cls
+    while isinstance(here, Class):
+        declared = here.dict.get("__slots__")
+        if declared is not None:
+            # A BARE STRING IS ONE SLOT, not a run of one-character ones.
+            names = [declared] if isinstance(declared, str) else None
+            if names is None:
+                try:
+                    names = list(declared)
+                except TypeError:
+                    names = []
+            if name in names:
+                return True
+        here = here.base
+    return False
 
 
 def _slot_allows(cls, name: str) -> bool:

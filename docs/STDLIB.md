@@ -803,6 +803,20 @@ than an impression.
 | --- | --- |
 | before archiving | 1668/1668 (100%) |
 | after archiving, with 8 modules rebuilt | 1627/1668 (97.5%) |
+| with the library rebuilt | 1665/1668 (99.8%) |
+
+**The last measurement found a bug the differential tests could not.** The
+conformance shim COMPILES each case to a native binary; `tests/stdlib/` runs
+them through the interpreter. `pep/0519-fspath` passed there and failed here,
+because a class declaring `__slots__` answered a `member_descriptor` for every
+name it did not define itself -- its METACLASS's methods included -- so
+`isinstance` through any ABC died on one. `os.PathLike` has `__slots__ = ()`,
+which is exactly that shape. The compiled runtime was asking whether an
+INSTANCE may carry the attribute, which is true for every name the moment one
+class in the chain omits `__slots__`; the question that belongs there is
+whether the name is DECLARED in a `__slots__`. Fixing it exposed the mirror
+image in the interpreter, which checked the class's OWN `__slots__` and missed
+one inherited from a base. Both walk the chain now.
 
 **41 cases, and not one of them is a wrong answer.** That is the number worth
 having, because it says the clear cost coverage and not correctness:

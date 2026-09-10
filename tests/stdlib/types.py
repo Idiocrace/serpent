@@ -1,5 +1,6 @@
 # COVERAGE: ModuleType, SimpleNamespace, new_class. NOT covered: FunctionType,
 # MethodType, GeneratorType, MappingProxyType, prepare_class -- see the module.
+import abc
 import types
 
 ns = types.SimpleNamespace(a=1, b="two")
@@ -66,3 +67,56 @@ for it in (list[int], int | str):
         len(it)
     except TypeError as exc:
         print(exc)
+
+# `__slots__` READ THROUGH THE CLASS is a `member_descriptor`, and the test
+# is whether the name is DECLARED -- not whether an instance could carry it.
+# Asking the second question made a class with `__slots__ = ()` answer a
+# descriptor for every name it did not define, its METACLASS's methods
+# included, so `isinstance` through an ABC died on one.
+class SlotBase:
+    __slots__ = ("held", "other")
+
+
+class SlotSub(SlotBase):
+    __slots__ = ("extra",)
+
+
+class OneSlot:
+    __slots__ = "only"
+
+
+class NoSlots:
+    pass
+
+
+for holder, key in ((SlotBase, "held"), (SlotBase, "missing"),
+                    (SlotSub, "extra"), (SlotSub, "held"),
+                    (OneSlot, "only"), (OneSlot, "o"), (NoSlots, "held")):
+    print(holder.__name__, key, "->",
+          type(getattr(holder, key, None)).__name__)
+
+held = SlotBase()
+held.held = 1
+print(held.held, hasattr(held, "__dict__"))
+try:
+    held.nope = 2
+except AttributeError as exc:
+    print(exc)
+
+
+class Structural(abc.ABC):
+    __slots__ = ()
+
+    @classmethod
+    def __subclasshook__(cls, sub):
+        if cls is Structural:
+            return hasattr(sub, "marker")
+        return NotImplemented
+
+
+class Marked:
+    marker = 1
+
+
+print(issubclass(Marked, Structural), isinstance(Marked(), Structural))
+print(issubclass(NoSlots, Structural), isinstance(NoSlots(), Structural))
