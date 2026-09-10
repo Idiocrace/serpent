@@ -201,6 +201,31 @@ while the object is still in use:
   the ones actually read: `apy_is`, the three container stores, the two
   cell stores, and `apy_setattr`.
 
+  THE PURE INSPECTORS ARE CERTIFIED TOO -- `apy_truth`, `apy_len`,
+  `apy_raw_len`, `apy_hash`, `apy_repr`, `apy_str`, `apy_text_of`, the six
+  comparisons, and the split halves of length, hash and equality. Each
+  answers a fresh value or a machine word and stores none of its arguments;
+  where one consults a user hook (`__bool__`, `__len__`, `__repr__`,
+  `__eq__`) that is interpreted Python, which the `_interpreted` argument
+  already covers. WHAT MADE THEM WORTH READING: `repr(g)` on a module-level
+  GLOBAL minted a temporary the frame never retired, so `sys.getrefcount`
+  read one high per call and anything held only that way waited for
+  teardown. A LOCAL never showed it -- the register holding the binding IS
+  the argument -- which is why the shape hid until a global was measured.
+
+  CALLING A CALLABLE HELD IN A GLOBAL still reads high, and this is now the
+  largest remaining one. A dynamic call goes through `apy_call`, whose
+  CALLEE argument is not retired. It is bounded by CALL SITES rather than by
+  calls -- fifty calls in a loop cost what one costs, because the register
+  is rewritten each time -- so it does not grow while a program runs.
+  Certifying it needs one thing first: invoking a FUNCTION retains nothing,
+  but invoking a CLASS builds an instance that points back at it and
+  `_held_by` does not count that back-pointer, so retiring the callee slot
+  would be sound for one and unproven for the other. Giving an instance a
+  counted reference to its type is CPython's own model and a wider change
+  than this list. IT IS ALSO WHY A CAPTURED VALUE OUTLIVES ITS CLOSURE: a
+  function's count cannot be cascaded from while calls inflate it.
+
   `apy_setattr` WAS THE NOTABLE ABSENTEE AND IS NOW CERTIFIED, which is what
   makes `h.child = Noisy(); h.child = None` finalize at the second store
   rather than at frame teardown. Every branch was read: a `__setattr__`

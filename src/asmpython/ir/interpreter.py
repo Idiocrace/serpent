@@ -1239,11 +1239,39 @@ _CMP = (Op.EQ, Op.NE, Op.LT, Op.LE, Op.GT, Op.GE)
 #:   * `C.__name__ = ...` writes a plain `str` into a field, and a `str`
 #:     handle is never tracked at all;
 #:   * everything else raises without storing.
+#: - THE PURE INSPECTORS, read one body at a time like the rest. Each
+#:   answers a fresh value or a machine word FROM its arguments and stores
+#:   none of them anywhere: `_apy_truth` and `_apy_len` answer an int,
+#:   `_apy_hash` and `_apy_hash_raw_of` a number, `_apy_repr`/`_apy_str`/
+#:   `_apy_text_of` a NEW string, and `_cmpop`'s six answer whatever the
+#:   comparison came to. Where one consults a user hook -- `__bool__`,
+#:   `__len__`, `__hash__`, `__repr__`, `__eq__` -- that is a call into
+#:   interpreted Python, which counts its parameters by construction, so
+#:   `_interpreted`'s argument covers those the same way it covers every
+#:   ordinary call.
+#:
+#:   WHY THESE AND NOT THE OTHER HUNDRED AND EIGHTY: because these are the
+#:   ones a program reaches with a value it is about to stop using.
+#:   `repr(g)` on a module-level global minted a temporary the frame never
+#:   retired, so `sys.getrefcount` read one high per call and anything
+#:   held only that way waited for teardown. A LOCAL never showed it --
+#:   the register holding the binding IS the argument -- which is why the
+#:   shape hid until a global was measured.
+#:
+#:   `apy_getattr` IS DELIBERATELY ABSENT from this group though it looks
+#:   like one of them: reading a method off an object builds a BOUND
+#:   function that holds the receiver, and whether that field is counted is
+#:   a separate question from this one.
 _NON_RETAINING = frozenset({
     "apy_is",
     "apy_seq_push", "apy_set_add", "apy_dict_set",
     "apy_cell_new", "apy_cell_set",
     "apy_setattr",
+    "apy_truth", "apy_len", "apy_raw_len",
+    "apy_hash", "apy_hash_raw_of",
+    "apy_repr", "apy_str", "apy_text_of",
+    "apy_eq", "apy_ne", "apy_lt", "apy_le", "apy_gt", "apy_ge",
+    "apy_eq_raw_of",
 })
 
 
