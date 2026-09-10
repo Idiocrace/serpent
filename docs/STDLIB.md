@@ -257,17 +257,31 @@ while the object is still in use:
   is known to write: `_pin_for_native` increfs the value instead of
   certifying the lambda, so that shape LEAKS rather than risking an early
   finalize.
-* a temporary in a function with a LOOP whose reads are not all in the same
-  basic block as its write. A back edge means "last STATIC read" is not
-  "last dynamic read", so retiring one is only sound where the value cannot
-  survive an iteration -- which a block-local register cannot, since a block
-  has no branches and the next pass writes a fresh value. Everything else in
-  such a function waits for frame teardown, and the compiler's own
-  bound-check lowering (a global load, a branch, then the use) puts a good
-  many ordinary temporaries on the wrong side of that line. What it is
-  usually visible as is ORDER rather than lateness: `for it in items` leaves
-  `it` holding the last element, so that one outlives the list and its
-  `__del__` runs after the others' instead of first.
+* a temporary in a block that lies ON A CYCLE. A back edge means "last
+  STATIC read" is not "last dynamic read", so retiring one is only sound
+  where the value cannot survive an iteration -- which a block-local
+  register cannot, since a block has no branches and the next pass writes a
+  fresh value.
+
+  THIS USED TO BE THE WHOLE FUNCTION and is now only the loop itself. A
+  block off every cycle cannot be visited twice in one invocation --
+  revisiting it would need a path from it back to itself, which is what
+  being on a cycle means -- so a register written and read only in such
+  blocks has a static read count that IS its dynamic one.
+  `interpreter._looping_blocks` finds them with two ordinary depth-first
+  walks. What it recovers is most of a loopy function, and the commonest
+  shape is a MODULE BODY: one `for` anywhere in it used to make every
+  temporary in the whole module wait for the end of the program, which
+  turned up twice while writing the tests for this -- both times the loop
+  was three lines from what was being measured and had nothing to do with
+  it.
+
+  WHAT IS LEFT is a value a LOOP-RESIDENT register still holds. An object
+  built in the last iteration and kept in one finalizes at frame teardown
+  rather than where the binding is cleared, because that register can be
+  read again. It is usually visible as ORDER rather than lateness: `for it
+  in items` leaves `it` holding the last element, so that one outlives the
+  list and its `__del__` runs after the others' instead of first.
 * the ORDER of a shutdown collection when several objects die together and
   one of them is also held by something the run over-held. Everything that
   should finalize does (see below); which of two `__del__`s prints first can

@@ -171,6 +171,10 @@ class Interpreter:
         #: `id(Function)` -> `(has_loop, read_count)`, memoised by
         #: `_analyze`. A function is analysed at most once per run.
         self._fn_analysis: dict[int, tuple[bool, dict[int, int]]] = {}
+        #: Which blocks of a function lie on a cycle, by function id -- see
+        #: `_looping_blocks`. Kept beside `_fn_analysis` and for the same
+        #: reason: it is a static property of the IR and never changes.
+        self._fn_loops: dict[int, frozenset] = {}
         for g in module.globals:
             addr = self.mem.alloc(max(1, g.size))
             if g.data:
@@ -663,13 +667,107 @@ class Interpreter:
             # this in the direction the scheme errs in: a register this
             # cannot prove local simply waits for teardown, as all of them
             # did before.
-            read_count = {reg: n for reg, n in read_count.items()
-                          if len(wrote.get(reg, ())) == 1
-                          and len(read_in.get(reg, ())) == 1
-                          and wrote[reg] == read_in[reg]}
+            # AND A BLOCK OFF THE CYCLE IS NOT IN THE LOOP AT ALL. The
+            # rule above is about one block; this is about the rest of the
+            # function. A block that lies on no cycle CANNOT BE VISITED
+            # TWICE in one invocation -- revisiting it would need a path
+            # from it back to itself, which is what being on a cycle
+            # means -- so a register written and read only in such blocks
+            # has a static read count that IS its dynamic one, exactly as
+            # in a function with no loop anywhere.
+            #
+            # WHAT THIS RECOVERS is most of a loopy function, and the
+            # commonest shape it recovers is a MODULE BODY: one `for`
+            # anywhere in it used to stop every temporary in the whole
+            # module from being retired, so a value passed to a call at
+            # module level waited for the end of the program. Measured
+            # twice while writing the tests for this file -- both times
+            # the loop was three lines away from what was being measured
+            # and had nothing to do with it.
+            looping = self._looping_blocks(fn)
+            read_count = {
+                reg: n for reg, n in read_count.items()
+                if (wrote.get(reg) and read_in.get(reg)
+                    and not (wrote[reg] | read_in[reg]) & looping)
+                or (len(wrote.get(reg, ())) == 1
+                    and len(read_in.get(reg, ())) == 1
+                    and wrote[reg] == read_in[reg])}
         result = (has_loop, read_count, frozenset(named))
         self._fn_analysis[id(fn)] = result
         return result
+
+    def _looping_blocks(self, fn: Function) -> frozenset:
+        """Every block of `fn` that lies ON A CYCLE, by label.
+
+        WHAT IT IS FOR: `_analyze` needs to tell a register that can be
+        read twice from one that cannot, and "this function has a loop
+        somewhere" is far too coarse -- a `for` anywhere in a module body
+        stopped every temporary in the whole module from retiring. A block
+        off every cycle runs at most once per invocation, so a register
+        confined to such blocks is as safe to retire as one in a function
+        with no loop at all.
+
+        KOSARAJU, because two ordinary depth-first walks are easier to
+        read than one clever one and this runs once per function. The
+        first orders the blocks by finish time; the second walks the
+        REVERSED edges in that order, and each tree it grows is one
+        strongly connected component. A component with more than one
+        block is a cycle; a single block is one only if it branches to
+        itself.
+
+        MEMOISED with the rest of the analysis -- purely static, so it
+        never changes across calls.
+        """
+        cached = self._fn_loops.get(id(fn))
+        if cached is not None:
+            return cached
+        blocks = {b.label: b for b in fn.blocks}
+        forward = {label: [s for s in blk.successors if s in blocks]
+                   for label, blk in blocks.items()}
+        backward: dict = {label: [] for label in blocks}
+        for label, succs in forward.items():
+            for one in succs:
+                backward[one].append(label)
+
+        def walk(graph, start, seen, out):
+            """One iterative depth-first walk, appending on FINISH."""
+            stack = [(start, 0)]
+            seen.add(start)
+            while stack:
+                label, i = stack[-1]
+                edges = graph[label]
+                while i < len(edges) and edges[i] in seen:
+                    i += 1
+                if i < len(edges):
+                    stack[-1] = (label, i + 1)
+                    seen.add(edges[i])
+                    stack.append((edges[i], 0))
+                    continue
+                stack.pop()
+                out.append(label)
+
+        order: list = []
+        seen: set = set()
+        for label in blocks:
+            if label not in seen:
+                walk(forward, label, seen, order)
+        looping: set = set()
+        seen = set()
+        for label in reversed(order):
+            if label in seen:
+                continue
+            group: list = []
+            walk(backward, label, seen, group)
+            if len(group) > 1:
+                looping.update(group)
+            elif label in forward.get(label, ()):
+                # A BLOCK THAT BRANCHES TO ITSELF is a component of one
+                # and is still a loop -- `while True: pass` compiles to
+                # exactly that.
+                looping.add(label)
+        out = frozenset(looping)
+        self._fn_loops[id(fn)] = out
+        return out
 
     def _has_cycle(self, fn: Function) -> bool:
         """Does `fn`'s control-flow graph have an actual cycle -- some
