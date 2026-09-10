@@ -66,6 +66,15 @@ GUARDS = {
     #: symbols ACTUALLY say, rather than the writer being asked to confirm its
     #: own layout.
     "readelf": lambda: bool(shutil.which("readelf")),
+    #: AN ASSEMBLER FOR A MACHINE THIS IS NOT. `llvm-mc` assembles AArch64
+    #: from any host, which is what makes the arm64 encoder testable on x86 --
+    #: the alternative would be a cross-binutils nobody has installed, and an
+    #: encoder checked only on the machine it targets is an encoder checked
+    #: nowhere. `llvm-objcopy` reads back what it wrote, and `ld.lld` resolves
+    #: the relocations so the LINKED bytes can be compared too.
+    "llvm-aarch64": lambda: bool(
+        shutil.which("llvm-mc") and shutil.which("llvm-objcopy")),
+    "lld": lambda: bool(shutil.which("ld.lld")),
 }
 
 

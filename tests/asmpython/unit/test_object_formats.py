@@ -80,10 +80,13 @@ def _asm(tmp_path, backend: str, target: str) -> str:
     return body.decode("utf-8")
 
 
+#: Pairs whose object writer exists, so nothing assembles them from text.
+OBJECT_PAIRS = {("x86-64", "x86_64-linux"), ("arm64", "aarch64-linux"),
+                ("arm64", "aarch64-none")}
+
 #: Pairs still assembled from text. THIS SHRINKS as backends grow encoders,
 #: and the claims about each pair move rather than disappear.
-TEXT_MATRIX = [row for row in MATRIX
-               if (row[0], row[1]) != ("x86-64", "x86_64-linux")]
+TEXT_MATRIX = [row for row in MATRIX if (row[0], row[1]) not in OBJECT_PAIRS]
 
 
 class TestTheDialectsDiffer:
@@ -109,13 +112,6 @@ class TestTheDialectsDiffer:
         text = _asm(tmp_path, backend, target)
         for directive in (".type", ".size", ".note.GNU-stack"):
             assert directive not in text, f"{directive} survives into Mach-O"
-
-    @harness.cases("backend,target", [("arm64", "aarch64-linux")])
-    def test_elf_still_declares_its_symbols(self, backend, target, tmp_path):
-        """The other half of the fix: ELF must not have LOST anything."""
-        text = _asm(tmp_path, backend, target)
-        assert ".type" in text and ".size" in text
-        assert "asmpython_main:" in text and "_asmpython_main:" not in text
 
     def test_coff_uses_its_own_definition_directive(self, tmp_path):
         """`.def/.scl/.endef`, and NOT the ELF pair.
@@ -157,17 +153,20 @@ class TestTheElfObjectSaysWhatTheDirectivesDid:
     path describes its symbols at all.
     """
 
-    def _object(self, tmp_path):
-        name, body = _artifact(tmp_path, "x86-64", "x86_64-linux")
+    def _object(self, tmp_path, backend="x86-64", target="x86_64-linux"):
+        name, body = _artifact(tmp_path, backend, target)
         assert name.endswith(".o"), name
         path = tmp_path / name
         path.write_bytes(body)
         return path
 
     @harness.needs("readelf")
-    def test_the_symbols_carry_their_kind_and_size(self, tmp_path):
-        out = subprocess.run(["readelf", "-sW", str(self._object(tmp_path))],
-                             capture_output=True, text=True, check=True).stdout
+    @harness.cases("backend,target", sorted(OBJECT_PAIRS))
+    def test_the_symbols_carry_their_kind_and_size(self, backend, target,
+                                                   tmp_path):
+        out = subprocess.run(
+            ["readelf", "-sW", str(self._object(tmp_path, backend, target))],
+            capture_output=True, text=True, check=True).stdout
         # `Num: Value Size Type Bind Vis Ndx Name`. The header row starts
         # with `Num:` and would otherwise parse as a symbol called `Name`.
         rows = {}

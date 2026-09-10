@@ -58,8 +58,7 @@ def main() -> int:
 #: keeping it would deny the ELF path that works.
 KNOWN_TEXT_EMITTERS = {
     ("x86-64", "x86_64-macos"), ("x86-64", "x86_64-windows"),
-    ("arm64", "aarch64-linux"), ("arm64", "aarch64-macos"),
-    ("arm64", "aarch64-none"),
+    ("arm64", "aarch64-macos"),
 }
 
 
@@ -184,15 +183,17 @@ class TestBinaryBackendsEmitBytes:
             "the gap list names a backend and target pair that does not exist")
         assert {b for b, _ in KNOWN_TEXT_EMITTERS} <= {"x86-64", "arm64"}
 
-    def test_x86_64_writes_its_own_elf(self):
-        """The pair that LEFT the list, asserted rather than merely absent.
+    @harness.cases("backend,target", [("x86-64", "x86_64-linux"),
+                                      ("arm64", "aarch64-linux"),
+                                      ("arm64", "aarch64-none")])
+    def test_the_pair_writes_its_own_elf(self, backend, target):
+        """The pairs that LEFT the list, asserted rather than merely absent.
 
         A pair silently dropped from the gap list and from `BINARY_PAIRS` --
         by a target being renamed, say -- would leave nothing testing it, and
-        the suite would go quiet about the one path that works.
+        the suite would go quiet about the paths that work.
         """
-        artifacts = _artifacts("x86-64", "x86_64-linux")
-        (name, data), = artifacts.items()
+        (name, data), = _artifacts(backend, target).items()
         assert name.endswith(".o"), name
         assert data[:4] == b"\x7fELF", "not an ELF object"
 
