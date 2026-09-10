@@ -751,20 +751,61 @@ class ObjectHost:
         # NOT `Func`, though a function plainly HOLDS its closure's cells
         # and its defaults, and both are increfed where they are attached
         # (`_apy_func_cell`, `_apy_func_default`). Reporting them here
-        # cascades on a function's own finalization, and A FUNCTION'S
-        # COUNT IS NOT MAINTAINED WELL ENOUGH TO CASCADE FROM: a closure
-        # reaches `_invoke_obj` as the `env` argument, which pins it and
-        # then unpins -- and that unpin found the count at zero and
-        # finalized `inner` after each call to it, dropping the cell,
-        # dropping the captured object, and printing `captured died`
-        # while the closure that captured it was still being called.
-        # Measured on exactly that program. So the increfs stay (they are
-        # what makes retiring a call argument safe -- see
-        # `interpreter.py`'s `_interpreted`) and the matching drop does
-        # not: a closed-over value outlives its closure here, which is
-        # LATE, and late is the direction this scheme is allowed to be
-        # wrong in. `docs/STDLIB.md` records it.
+        # cascades on a function's own finalization, and the cascade is
+        # EARLY, which is the one direction this scheme refuses.
+        #
+        # THE FIRST REASON IS FIXED AND THE SECOND IS NOT. A closure used
+        # to reach `_invoke_obj` as the `env` argument with a count of
+        # ZERO -- because a dynamic call never retired its CALLEE slot, so
+        # nothing counted the function at all -- and the unpin after each
+        # call finalized `inner` while it was still being called.
+        # `interpreter._CALLEE_FIRST` retires that slot now and a
+        # function's count matches CPython's (`sys.getrefcount` on a
+        # closure, before and after any number of calls). Adding the
+        # cascade on top of THAT still fires early, one step sooner: a
+        # closure RETURNED from the function that built it is finalized at
+        # that function's teardown, before the caller's binding has taken
+        # the handle -- `gone: captured` printed before the line after the
+        # call. So the returned-value handoff (`protect_handoff`/`settle`)
+        # does not cover a `Func`, and that is what the next attempt has
+        # to fix first. Measured, both times.
+        #
+        # Until then the increfs stay (they are what makes retiring a call
+        # argument safe -- see `interpreter.py`'s `_interpreted`) and the
+        # matching drop does not: a closed-over value outlives its closure,
+        # which is LATE, and late is the direction this scheme is allowed
+        # to be wrong in. `docs/STDLIB.md` records it.
         return out
+
+    def callee_keeps_nothing(self, h: int) -> bool:
+        """Does INVOKING the value behind `h` retain the value itself?
+
+        THE CALLEE OF A DYNAMIC CALL IS AN ARGUMENT LIKE ANY OTHER, and
+        `apy_call` is a host primitive, so its argument registers are not
+        retired -- which made `alias()` on a module-level global read one
+        reference high per CALL SITE and is why a function's own count was
+        never trustworthy enough to cascade from.
+
+        A PLAIN FUNCTION IS THE CASE THAT CAN BE ANSWERED HERE. Calling one
+        runs interpreted Python, which counts its parameters by construction
+        and keeps no reference to the function object itself, so the caller's
+        temporary is free the moment the call returns.
+
+        EVERYTHING ELSE ANSWERS FALSE, and each for its own reason. A CLASS
+        builds an instance that points BACK at it through `Instance.cls`, and
+        that back-pointer is not counted -- retiring the class's temporary
+        could finalize a class an instance still names. A BUILTIN TYPE used
+        as a constructor goes the same way. A `Native` is a host lambda this
+        file cannot certify one at a time. An `Instance` with `__call__` is
+        probably safe by the interpreted argument and is left out until
+        something measures it, because "probably" is not the standard this
+        list is held to.
+        """
+        try:
+            v = self._cell(int(h))
+        except (IndexError, ValueError):
+            return False
+        return isinstance(v, Func) and not getattr(v, "is_type", False)
 
     def _decref_contents(self, obj) -> None:
         """The cascade: dropping the last reference to a container drops

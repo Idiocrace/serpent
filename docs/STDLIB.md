@@ -213,18 +213,18 @@ while the object is still in use:
   teardown. A LOCAL never showed it -- the register holding the binding IS
   the argument -- which is why the shape hid until a global was measured.
 
-  CALLING A CALLABLE HELD IN A GLOBAL still reads high, and this is now the
-  largest remaining one. A dynamic call goes through `apy_call`, whose
-  CALLEE argument is not retired. It is bounded by CALL SITES rather than by
-  calls -- fifty calls in a loop cost what one costs, because the register
-  is rewritten each time -- so it does not grow while a program runs.
-  Certifying it needs one thing first: invoking a FUNCTION retains nothing,
-  but invoking a CLASS builds an instance that points back at it and
-  `_held_by` does not count that back-pointer, so retiring the callee slot
-  would be sound for one and unproven for the other. Giving an instance a
-  counted reference to its type is CPython's own model and a wider change
-  than this list. IT IS ALSO WHY A CAPTURED VALUE OUTLIVES ITS CLOSURE: a
-  function's count cannot be cascaded from while calls inflate it.
+  THE CALLEE OF A DYNAMIC CALL IS RETIRED TOO, when the value in that slot
+  can be certified. `apy_call` and its three siblings take the callable as
+  their first argument, and leaving it alone made `alias()` on a
+  module-level global read one high per CALL SITE. A PLAIN FUNCTION IS THE
+  CASE THAT CAN BE ANSWERED: calling one runs interpreted Python, which
+  counts its parameters by construction and keeps no reference to the
+  function object itself. A CLASS CANNOT -- the instance it builds points
+  back at it through `Instance.cls`, which is not counted -- and neither
+  can a host `Native`, for the reason none of them can be certified one at
+  a time. So `sys.getrefcount` on a function now matches CPython exactly,
+  before and after any number of calls, through a global or a local,
+  closure or not.
 
   `apy_setattr` WAS THE NOTABLE ABSENTEE AND IS NOW CERTIFIED, which is what
   makes `h.child = Noisy(); h.child = None` finalize at the second store
@@ -238,12 +238,21 @@ while the object is still in use:
   is known to write: `_pin_for_native` increfs the value instead of
   certifying the lambda, so that shape LEAKS rather than risking an early
   finalize.
-* a value held only by a CLOSURE CELL. The cell counts its contents now (it
-  had to, before a call argument could be retired at all), but a FUNCTION
-  does not count its cells' deaths: a function's own handle count is not
-  maintained well enough to cascade from -- `_invoke_obj` pins and unpins a
-  closure around every call to it, and that unpin found the count at zero.
-  So a captured value outlives the closure that captured it.
+* a value held only by a CLOSURE CELL. The cell counts its contents (it had
+  to, before a call argument could be retired at all), but a FUNCTION does
+  not report its cells to `_held_by`, so nothing drops them when the closure
+  dies and a captured value outlives the closure that captured it.
+
+  THE FIRST OBSTACLE IS GONE AND A SECOND ONE IS NOT, and both were
+  measured on the same program. A closure used to reach `_invoke_obj` as
+  the `env` argument with a count of ZERO -- because a dynamic call never
+  retired its callee slot -- and the unpin after each call finalized it
+  mid-call. That is fixed: a function's count is CPython's now. Adding the
+  cascade on top still fires EARLY, one step sooner: a closure RETURNED
+  from the function that built it is finalized at that function's teardown,
+  before the caller's binding has taken the handle. The returned-value
+  handoff (`protect_handoff`/`settle`) does not cover a `Func`, and that is
+  what has to be fixed before the cascade can go in.
 * a temporary in a function with a LOOP whose reads are not all in the same
   basic block as its write. A back edge means "last STATIC read" is not
   "last dynamic read", so retiring one is only sound where the value cannot

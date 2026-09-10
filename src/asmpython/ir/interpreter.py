@@ -1141,6 +1141,16 @@ class Interpreter:
             if self._interpreted(callee):
                 for reg in ins.args:
                     self._consume(fr, reg)
+            elif (ins.sym in _CALLEE_FIRST and args
+                  and self.objects is not None
+                  and self.objects.callee_keeps_nothing(args[0])):
+                # THE CALLEE ONLY, and only when the value can be certified
+                # -- see `ObjectHost.callee_keeps_nothing`. The other
+                # arguments of a dynamic call are an ADDRESS and a COUNT,
+                # machine words `_consume` would ignore anyway; the Python
+                # arguments live in the argument buffer and are retired by
+                # `_release_argbuf` above.
+                self._consume(fr, ins.args[0])
             return res
         if op is Op.CALL_PTR:
             idx = int(a(0)) & ~_FUNC_TAG
@@ -1262,6 +1272,14 @@ _CMP = (Op.EQ, Op.NE, Op.LT, Op.LE, Op.GT, Op.GE)
 #:   like one of them: reading a method off an object builds a BOUND
 #:   function that holds the receiver, and whether that field is counted is
 #:   a separate question from this one.
+#: The dynamic-call primitives whose FIRST argument is the callable. They
+#: are not on `_NON_RETAINING` -- what a call does with its arguments is the
+#: callee's business, not this list's -- but the callee SLOT can be retired
+#: on its own when the value in it is one `callee_keeps_nothing` certifies.
+_CALLEE_FIRST = frozenset({
+    "apy_call", "apy_call_kw", "apy_call_spread", "apy_call_spread_kw",
+})
+
 _NON_RETAINING = frozenset({
     "apy_is",
     "apy_seq_push", "apy_set_add", "apy_dict_set",

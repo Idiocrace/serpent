@@ -143,3 +143,47 @@ for bad in (9, -1):
         mon.get_tool(bad)
     except ValueError as exc:
         print("bad id:", exc)
+
+
+# --- A FUNCTION'S COUNT IS CPYTHON'S, before and after any number of calls.
+# The callee of a dynamic call is an argument like any other, and leaving
+# that slot alone made a callable held in a global read one high per CALL
+# SITE -- which is also why a function's count could not be cascaded from.
+#
+# INSIDE A FUNCTION, like every other count measured in this file: a module
+# body containing a loop does not retire its temporaries, so a count read at
+# module level here would be measuring that divergence instead of this one.
+def counted():
+    return 1
+
+
+def makes_one():
+    captured = 5
+
+    def held():
+        return captured
+
+    return held
+
+
+def function_counts():
+    named = counted
+    print("alias:", sys.getrefcount(named))
+    named()
+    named()
+    print("alias after two calls:", sys.getrefcount(named))
+
+    closed = makes_one()
+    print("closure:", sys.getrefcount(closed))
+    closed()
+    closed()
+    closed()
+    print("closure after three calls:", sys.getrefcount(closed))
+    also = closed
+    print("two names:", sys.getrefcount(closed))
+    del also
+    print("back to one:", sys.getrefcount(closed))
+
+
+function_counts()
+print("--- function counts done ---")
