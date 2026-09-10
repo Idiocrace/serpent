@@ -185,6 +185,25 @@ callback for a collected cycle fires BEFORE the cycle is torn down, and a
 callback whose own `ref` is inside the same garbage does not fire at all --
 both CPython's documented behaviour, both checked against it.
 
+**A CAPTURED VALUE DIES WITH ITS CLOSURE**, which took three findings in a
+row and is worth the space because each one hid the next. The cell counts
+what is in it and a function counts its cells, so dropping the last
+reference to a closure drops the box and what the box holds -- but reporting
+those cells to `_held_by` fired EARLY twice before it fired correctly.
+First, a closure reached `_invoke_obj` as the `env` argument with a count of
+ZERO, because a dynamic call never retired its CALLEE slot, so nothing
+counted the function at all and the unpin after each call finalized it
+mid-call. Second, with the count right, a closure RETURNED from the function
+that built it still died at that function's teardown -- and the reason was
+not the returned-value handoff, which works: `_invoke_obj` minted a FRESH
+HANDLE for the callee on every call, with its own count starting at zero, so
+`_call`'s parameter incref and teardown decref took that second count from
+one to zero and finalized the function while it was being called. The
+interned handle is used for an unbound function now; a bound method still
+needs its own, because the receiver travels in the value. The same shape of
+bug the `Cell` interning fix found earlier, in the one place left holding
+it.
+
 **LATE, NEVER EARLY, and this is the direction the whole scheme is built to
 be wrong in** -- an under-decref delays a finalizer, an over-decref runs one
 while the object is still in use:
@@ -238,21 +257,6 @@ while the object is still in use:
   is known to write: `_pin_for_native` increfs the value instead of
   certifying the lambda, so that shape LEAKS rather than risking an early
   finalize.
-* a value held only by a CLOSURE CELL. The cell counts its contents (it had
-  to, before a call argument could be retired at all), but a FUNCTION does
-  not report its cells to `_held_by`, so nothing drops them when the closure
-  dies and a captured value outlives the closure that captured it.
-
-  THE FIRST OBSTACLE IS GONE AND A SECOND ONE IS NOT, and both were
-  measured on the same program. A closure used to reach `_invoke_obj` as
-  the `env` argument with a count of ZERO -- because a dynamic call never
-  retired its callee slot -- and the unpin after each call finalized it
-  mid-call. That is fixed: a function's count is CPython's now. Adding the
-  cascade on top still fires EARLY, one step sooner: a closure RETURNED
-  from the function that built it is finalized at that function's teardown,
-  before the caller's binding has taken the handle. The returned-value
-  handoff (`protect_handoff`/`settle`) does not cover a `Func`, and that is
-  what has to be fixed before the cascade can go in.
 * a temporary in a function with a LOOP whose reads are not all in the same
   basic block as its write. A back edge means "last STATIC read" is not
   "last dynamic read", so retiring one is only sound where the value cannot

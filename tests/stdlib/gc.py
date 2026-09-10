@@ -213,3 +213,77 @@ def through_a_property():
 
 through_a_property()
 print("--- property ---")
+
+
+# --- A CAPTURED VALUE DIES WITH THE CLOSURE THAT CAPTURED IT ---------------
+#
+# The cell counts what is in it and a function counts its cells, so dropping
+# the last reference to a closure drops the box and what the box holds. What
+# stood in the way was not the cascade: a closure reached the call path
+# through a SECOND handle minted per call, whose own count went one-to-zero
+# every time, so the function was finalized while it was being called.
+class Captured:
+    def __init__(self, tag):
+        self.tag = tag
+
+    def __del__(self):
+        print("capture gone:", self.tag)
+
+
+def in_scope():
+    v = Captured("scoped")
+
+    def read():
+        return v.tag
+
+    print("read:", read())
+    print("end of scope")
+
+
+in_scope()
+print("--- in scope ---")
+
+
+def escapes():
+    def build():
+        v = Captured("escaped")
+
+        def read():
+            return v.tag
+
+        return read
+
+    fn = build()
+    print("read:", fn())
+    print("still holding")
+    del fn
+    print("dropped")
+
+
+escapes()
+print("--- escapes ---")
+
+
+# THREE CALLS WRITTEN OUT rather than a loop: a function containing one does
+# not retire its temporaries at their last read -- see `docs/STDLIB.md` -- so
+# a loop here would measure that divergence instead of this one.
+def called_many_times():
+    def build():
+        v = Captured("repeated")
+
+        def read():
+            return v.tag
+
+        return read
+
+    fn = build()
+    fn()
+    fn()
+    fn()
+    print("after three calls")
+    fn = None
+    print("cleared")
+
+
+called_many_times()
+print("--- repeated ---")

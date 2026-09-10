@@ -748,33 +748,11 @@ class ObjectHost:
             # would keep `Foo` alive for the rest of the run even after both
             # the name and the closure were gone.
             walk(obj.slot)
-        # NOT `Func`, though a function plainly HOLDS its closure's cells
-        # and its defaults, and both are increfed where they are attached
-        # (`_apy_func_cell`, `_apy_func_default`). Reporting them here
-        # cascades on a function's own finalization, and the cascade is
-        # EARLY, which is the one direction this scheme refuses.
-        #
-        # THE FIRST REASON IS FIXED AND THE SECOND IS NOT. A closure used
-        # to reach `_invoke_obj` as the `env` argument with a count of
-        # ZERO -- because a dynamic call never retired its CALLEE slot, so
-        # nothing counted the function at all -- and the unpin after each
-        # call finalized `inner` while it was still being called.
-        # `interpreter._CALLEE_FIRST` retires that slot now and a
-        # function's count matches CPython's (`sys.getrefcount` on a
-        # closure, before and after any number of calls). Adding the
-        # cascade on top of THAT still fires early, one step sooner: a
-        # closure RETURNED from the function that built it is finalized at
-        # that function's teardown, before the caller's binding has taken
-        # the handle -- `gone: captured` printed before the line after the
-        # call. So the returned-value handoff (`protect_handoff`/`settle`)
-        # does not cover a `Func`, and that is what the next attempt has
-        # to fix first. Measured, both times.
-        #
-        # Until then the increfs stay (they are what makes retiring a call
-        # argument safe -- see `interpreter.py`'s `_interpreted`) and the
-        # matching drop does not: a closed-over value outlives its closure,
-        # which is LATE, and late is the direction this scheme is allowed
-        # to be wrong in. `docs/STDLIB.md` records it.
+        elif isinstance(obj, Func):
+            for one in obj.cells or ():
+                walk(one)
+            for one in obj.defaults or ():
+                walk(one)
         return out
 
     def callee_keeps_nothing(self, h: int) -> bool:
@@ -1571,7 +1549,17 @@ class ObjectHost:
                        f"{'was' if got == 1 else 'were'} given")
             raise _UserFailed
         fn = self._interp.module.functions[f.code & ~_FUNC_TAG]
-        env = self._new(f)
+        # THE INTERNED HANDLE FOR AN UNBOUND FUNCTION, a fresh one only for a
+        # BOUND method. `_new` mints a new cell every time and gives it its
+        # own `_refcount` entry starting at zero, so a closure reached
+        # through here got a SECOND identity per call -- and `_call`'s
+        # parameter incref and teardown decref took that second count from
+        # one to zero, finalizing the function on every call. Invisible until
+        # `_held_by` learned to cascade from a `Func` to its cells, at which
+        # point it dropped the captured value while the closure was still
+        # live. A bound method is a fresh object per access and must keep
+        # its own handle: the receiver travels in the value.
+        env = self._value(f) if f.bound is None else self._new(f)
         values = [self._value(s) for s in slots]
         # PINNED FOR THE CALL. `env` and every argument handle here may
         # exist ONLY as this host frame's own local right now -- nothing
