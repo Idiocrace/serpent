@@ -363,8 +363,7 @@ def _emit_parallel_moves(e: _Emitter, moves: list[tuple[str, str]]) -> None:
 
 class Arm64Backend(Backend):
     name = "arm64"
-    description = ("AArch64 machine code (AAPCS64): ELF objects directly, "
-                   "assembly for Mach-O until that writer exists")
+    description = "AArch64 machine code (AAPCS64): ELF and Mach-O objects"
     default_target = "aarch64-none"
 
     def symbol(self, name: str, dialect: AsmDialect) -> str:
@@ -375,14 +374,33 @@ class Arm64Backend(Backend):
         """
         return dialect.symbol_prefix + (ENTRY_SYMBOL if name == "main" else name)
 
+    def global_symbol(self, name: str, dialect: AsmDialect) -> str:
+        """The assembler symbol for an IR global's name.
+
+        ONE PLACE, FOR THE REASON `symbol` GIVES. Globals had the same split
+        that functions used to: the definition applied `dialect.symbol_prefix`
+        and `GLOBAL_ADDR` did not, so on Mach-O a program defined `___rodata0`
+        and referenced `__rodata0`. Nothing caught it because nothing linked a
+        Mach-O object -- and when something did, x86-64 reported it as a
+        displacement four gigabytes out of range while AArch64 quietly
+        resolved every constant to address zero.
+
+        Separate from `symbol` because that one renames `main`, which is a
+        fact about the entry point and not about names in general.
+        """
+        return dialect.symbol_prefix + name
+
     def emit(self, module: Module, target: Target) -> dict[str, bytes]:
         abi = abi_for(target)
         dialect = dialect_for(target)
+        if target.object_format == "macho":
+            from .machoemit import object_bytes as macho_bytes
+            return {"out.o": macho_bytes(self, module, abi, dialect)}
         if target.object_format == "elf":
-            # THE BACKEND DECIDES EVERY WORD for a format it can write. See
-            # `encode.py` and `objemit.py`; the assembly path below stays for
-            # Mach-O, whose object writer is not built yet, and for `--emit`,
-            # which is how a selection decision is read.
+            # THE BACKEND DECIDES EVERY WORD. See `encode.py` and the two
+            # object emitters beside it. The assembly path below is now
+            # reached by no registered target and is kept only for a format
+            # added before its writer is.
             from .objemit import object_bytes
             return {"out.o": object_bytes(self, module, abi, dialect)}
         out: list[str] = [
@@ -401,7 +419,7 @@ class Arm64Backend(Backend):
         return {"out.s": ("\n".join(out) + "\n").encode("utf-8")}
 
     def _global(self, g: Global, dialect: AsmDialect) -> list[str]:
-        name = dialect.symbol_prefix + g.name
+        name = self.global_symbol(g.name, dialect)
         lines = [f"\t.globl {name}"] if g.linkage is Linkage.EXPORT else []
         lines.append(f"\t.align {max(3, (g.align or 8).bit_length() - 1)}")
         lines.append(f"{name}:")
@@ -578,7 +596,7 @@ class Arm64Backend(Backend):
             case Op.GLOBAL_ADDR | Op.FUNC_ADDR:
                 dest = e.out_register(ins.dst, SCRATCH_A)
                 target = (self.symbol(ins.sym, dialect) if op is Op.FUNC_ADDR
-                          else ins.sym)
+                          else self.global_symbol(ins.sym, dialect))
                 e.emit(f"adrp {dest}, {target}")
                 e.emit(f"add {dest}, {dest}, :lo12:{target}")
                 e.store(dest, ins.dst)

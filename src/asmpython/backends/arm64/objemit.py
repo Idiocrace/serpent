@@ -77,7 +77,7 @@ def object_bytes(backend, module: Module, abi, dialect) -> bytes:
     bss = 0
     for g in module.globals:
         binding = STB_GLOBAL if g.linkage is Linkage.EXPORT else STB_LOCAL
-        name = dialect.symbol_prefix + g.name
+        name = backend.global_symbol(g.name, dialect)
         align = g.align or 8
         if g.data is None:
             bss = (bss + align - 1) & ~(align - 1)

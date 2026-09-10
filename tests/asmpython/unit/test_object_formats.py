@@ -81,8 +81,11 @@ def _asm(tmp_path, backend: str, target: str) -> str:
 
 
 #: Pairs whose object writer exists, so nothing assembles them from text.
-OBJECT_PAIRS = {("x86-64", "x86_64-linux"), ("arm64", "aarch64-linux"),
-                ("arm64", "aarch64-none")}
+OBJECT_PAIRS = {(backend, target) for backend, target, _ in MATRIX}
+
+#: The subset of those that are ELF, for the claims that read ELF structure.
+ELF_PAIRS = {p for p in OBJECT_PAIRS
+             if target_registry.get(p[1]).object_format == "elf"}
 
 #: Pairs still assembled from text. THIS SHRINKS as backends grow encoders,
 #: and the claims about each pair move rather than disappear.
@@ -90,39 +93,77 @@ TEXT_MATRIX = [row for row in MATRIX if (row[0], row[1]) not in OBJECT_PAIRS]
 
 
 class TestTheDialectsDiffer:
+    @harness.needs("llvm-aarch64")
     @harness.cases("backend,target", [(b, t) for b, t, _ in MATRIX
                                       if t.endswith("macos")])
     def test_macho_symbols_wear_an_underscore(self, backend, target, tmp_path):
-        """Mach-O's C ABI prefixes every symbol, at the definition AND the call."""
-        text = _asm(tmp_path, backend, target)
-        assert "_asmpython_main:" in text, "the entry point is not prefixed"
-        assert "_add:" in text, "a defined symbol is not prefixed"
-        # THE CALL SITE TOO, or the call resolves to nothing. Read off the
-        # branch instruction rather than by position: the definition of `add`
-        # precedes the call to it, so "before the label" finds the wrong half.
-        call = [l for l in text.splitlines()
-                if l.lstrip().startswith(("call", "bl "))]
-        assert call, "no call instruction in the output"
-        assert all("_add" in l for l in call), f"call site not prefixed: {call}"
+        """Mach-O's C ABI prefixes every symbol, at the definition AND the use.
 
+        READ OFF THE SYMBOL TABLE now that the artifact is an object. The
+        claim is the same one the text version made, and it is the one that
+        matters: a prefix applied at the definition and not at the call site
+        links to nothing.
+        """
+        name, body = _artifact(tmp_path, backend, target)
+        (tmp_path / name).write_bytes(body)
+        out = subprocess.run(["llvm-nm", str(tmp_path / name)],
+                             capture_output=True, text=True, check=True).stdout
+        names = [line.split()[-1] for line in out.splitlines() if line.strip()]
+        assert "_asmpython_main" in names, "the entry point is not prefixed"
+        assert "_add" in names, "a defined symbol is not prefixed"
+        assert not any(n in ("asmpython_main", "add") for n in names), (
+            "an unprefixed name survives into Mach-O")
+
+    @harness.needs("llvm-aarch64")
     @harness.cases("backend,target", [(b, t) for b, t, _ in MATRIX
                                       if t.endswith("macos")])
-    def test_macho_has_no_elf_directives(self, backend, target, tmp_path):
-        """`.type`, `.size` and `.note.GNU-stack` are each a hard error there."""
-        text = _asm(tmp_path, backend, target)
-        for directive in (".type", ".size", ".note.GNU-stack"):
-            assert directive not in text, f"{directive} survives into Mach-O"
+    def test_macho_sections_are_in_their_segments(self, backend, target,
+                                                  tmp_path):
+        """What "no ELF directives" meant, once there are no directives.
 
-    def test_coff_uses_its_own_definition_directive(self, tmp_path):
-        """`.def/.scl/.endef`, and NOT the ELF pair.
-
-        COFF's `.def` line carries a `.type 32;` of its own, so the test is
-        that `.type x, @function` is absent -- not that the four characters
-        `.type` are.
+        The text test asserted that `.type`, `.size` and `.note.GNU-stack` did
+        not survive. An object has none of those by construction, so the
+        equivalent claim is that the sections are Mach-O's own: `__text` in
+        `__TEXT`, and no section still called `.text`.
         """
-        text = _asm(tmp_path, "x86-64", "x86_64-windows")
-        assert ".def" in text and ".endef" in text
-        assert "@function" not in text and ".size" not in text
+        name, body = _artifact(tmp_path, backend, target)
+        (tmp_path / name).write_bytes(body)
+        out = subprocess.run(["llvm-objdump", "-h", str(tmp_path / name)],
+                             capture_output=True, text=True, check=True).stdout
+        assert "__text" in out, out
+        assert ".text" not in out, "an ELF section name survives into Mach-O"
+
+    def test_coff_marks_a_function_as_one(self, tmp_path):
+        """What `.def/.scl/.endef` was for, read off the symbol record.
+
+        THE CLAIM MOVED WITH THE OUTPUT. Those directives existed to tell an
+        assembler that a symbol names code and what its storage class is;
+        writing the object directly means setting `Type` and `StorageClass`,
+        so the test reads those two fields. Keeping the text version would
+        have tested a path nothing takes any more.
+        """
+        import struct
+        _, body = _artifact(tmp_path, "x86-64", "x86_64-windows")
+        symtab, count = struct.unpack_from("<II", body, 8)
+        found = {}
+        strings_at = symtab + 18 * count
+        for index in range(count):
+            at = symtab + 18 * index
+            raw = body[at:at + 8]
+            if raw[:4] == b"\0\0\0\0":
+                # THE OFFSET COUNTS FROM THE TABLE'S FIRST BYTE, which is the
+                # four-byte length -- so it is never less than four, and never
+                # needs that four subtracted again.
+                offset, = struct.unpack_from("<I", raw, 4)
+                end = body.index(b"\0", strings_at + offset)
+                name = body[strings_at + offset:end].decode()
+            else:
+                name = raw.rstrip(b"\0").decode()
+            _, _, kind, storage, _ = struct.unpack_from("<IhHBB", body, at + 8)
+            found[name] = (kind, storage)
+        kind, storage = found["asmpython_main"]
+        assert kind == 0x20, "the entry point is not marked as a function"
+        assert storage == 2, "the entry point is not external"
 
     @harness.cases("backend,a,b", [
         ("x86-64", "x86_64-linux", "x86_64-macos"),
@@ -161,7 +202,7 @@ class TestTheElfObjectSaysWhatTheDirectivesDid:
         return path
 
     @harness.needs("readelf")
-    @harness.cases("backend,target", sorted(OBJECT_PAIRS))
+    @harness.cases("backend,target", sorted(ELF_PAIRS))
     def test_the_symbols_carry_their_kind_and_size(self, backend, target,
                                                    tmp_path):
         out = subprocess.run(
@@ -198,8 +239,14 @@ class TestTheElfObjectSaysWhatTheDirectivesDid:
 
 @harness.skip_if(not HAS_CLANG, reason="no clang to assemble with")
 class TestItActuallyAssembles:
-    """clang cross-assembles all three formats from any host, so this runs
-    everywhere rather than only on the platform it describes."""
+    """clang cross-assembles all three formats from any host, so this ran
+    everywhere rather than only on the platform it describes.
+
+    THERE IS NOTHING LEFT TO ASSEMBLE. `TEXT_MATRIX` is empty: every pair in
+    `MATRIX` now writes its own object. The class stays as the place this
+    check belongs if a backend ever emits text again -- and its emptiness is
+    asserted below rather than left as a silently vacuous run.
+    """
 
     @harness.cases("backend,target,triple", TEXT_MATRIX)
     def test_the_output_assembles(self, backend, target, triple, tmp_path):
@@ -211,3 +258,12 @@ class TestItActuallyAssembles:
             capture_output=True, text=True)
         assert done.returncode == 0, (
             f"{backend}/{target} did not assemble as {triple}:\n{done.stderr}")
+
+
+class TestNothingInTheMatrixStopsAtAssembly:
+    def test_every_pair_writes_an_object(self):
+        """A vacuous parametrised class reports as a pass and tests nothing,
+        so the fact that there is nothing left to assemble is asserted."""
+        assert TEXT_MATRIX == [], (
+            f"these pairs still emit assembly: "
+            f"{[(b, t) for b, t, _ in TEXT_MATRIX]}")

@@ -556,8 +556,7 @@ class _Emitter:
 
 class X86_64Backend(Backend):
     name = "x86-64"
-    description = ("x86-64 machine code: ELF objects directly, assembly "
-                   "for COFF and Mach-O until those writers exist")
+    description = "x86-64 machine code: ELF, COFF and Mach-O objects"
     # The machine this is running on, not a platform fixed at
     # authoring time: `asmpython build --backend x86-64` on Windows used to
     # emit ELF directives and hand them to a COFF assembler.
@@ -579,14 +578,36 @@ class X86_64Backend(Backend):
             name = ENTRY_SYMBOL
         return dialect.symbol_prefix + name
 
+    def global_symbol(self, name: str, dialect: AsmDialect) -> str:
+        """The assembler symbol for an IR global's name.
+
+        ONE PLACE, FOR THE REASON `symbol` GIVES. Globals had the same split
+        that functions used to: the definition applied `dialect.symbol_prefix`
+        and `GLOBAL_ADDR` did not, so on Mach-O a program defined `___rodata0`
+        and referenced `__rodata0`. Nothing caught it because nothing linked a
+        Mach-O object -- and when something did, x86-64 reported it as a
+        displacement four gigabytes out of range while AArch64 quietly
+        resolved every constant to address zero.
+
+        Separate from `symbol` because that one renames `main`, which is a
+        fact about the entry point and not about names in general.
+        """
+        return dialect.symbol_prefix + name
+
     def emit(self, module: Module, target: Target) -> dict[str, bytes]:
         abi = abi_for(target)
         dialect = dialect_for(target)
+        if target.object_format == "macho":
+            from .machoemit import object_bytes as macho_bytes
+            return {"out.o": macho_bytes(self, module, abi, dialect)}
+        if target.object_format == "coff":
+            from .coffemit import object_bytes as coff_bytes
+            return {"out.obj": coff_bytes(self, module, abi, dialect)}
         if target.object_format == "elf":
-            # THE BACKEND DECIDES EVERY BYTE for a format it can write. See
-            # `encode.py` and `objemit.py`; the assembly path below stays for
-            # the two formats whose object writers are not built yet, and for
-            # `--emit`, which is how a selection decision is read.
+            # THE BACKEND DECIDES EVERY BYTE. See `encode.py` and the three
+            # object emitters beside it. The assembly path below is now
+            # reached by no registered target and is kept only for a format
+            # added before its writer is.
             from .objemit import object_bytes
             return {"out.o": object_bytes(self, module, abi, dialect)}
         out: list[str] = [
@@ -608,9 +629,10 @@ class X86_64Backend(Backend):
 
     # ── globals ─────────────────────────────────────────────────────────────
     def _global(self, g: Global, dialect: AsmDialect) -> list[str]:
-        lines = [f"\t.globl {g.name}"] if g.linkage is Linkage.EXPORT else []
+        name = self.global_symbol(g.name, dialect)
+        lines = [f"\t.globl {name}"] if g.linkage is Linkage.EXPORT else []
         lines.append(dialect.align(g.align or 8))
-        lines.append(f"{g.name}:")
+        lines.append(f"{name}:")
         if g.data is None:
             lines.append(f"\t.zero {max(1, g.size)}")
         else:
@@ -971,7 +993,12 @@ class X86_64Backend(Backend):
                 e.store_from("r10", ins.dst)
 
             case Op.GLOBAL_ADDR | Op.FUNC_ADDR:
-                e.emit(f"leaq {ins.sym}(%rip), %r10")
+                # A FUNCTION'S NAME AND A GLOBAL'S ARE SPELLED DIFFERENTLY --
+                # `symbol` renames `main` and `global_symbol` does not -- so
+                # sharing the case must not mean sharing the lookup.
+                target = (self.symbol(ins.sym, dialect) if op is Op.FUNC_ADDR
+                          else self.global_symbol(ins.sym, dialect))
+                e.emit(f"leaq {target}(%rip), %r10")
                 e.store_from("r10", ins.dst)
 
             case _ if op in _SIMPLE_BINOP:

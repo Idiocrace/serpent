@@ -16,9 +16,10 @@ because every test asks whether the program produced the right answer and the
 answer is right either way.
 
 So the check is on the ARTIFACT, not on the backend's own description of
-itself. `KNOWN_TEXT_EMITTERS` is the list of backend-and-target pairs that
-still emit assembly; it is expected to shrink to empty, and a pair leaving it
-must also be removed from that list or `test_the_gap_list_is_not_stale` fails.
+itself. `KNOWN_TEXT_EMITTERS` was the list of backend-and-target pairs that
+still emitted assembly. IT IS NOW EMPTY -- every binary backend encodes its
+own instructions and writes its own object file for every target it serves --
+and the assertion is that it stays empty.
 """
 from __future__ import annotations
 
@@ -56,10 +57,10 @@ def main() -> int:
 #: still has no COFF or Mach-O writer to put them in. Keyed by backend alone,
 #: removing it would claim a completeness it does not have on Windows, and
 #: keeping it would deny the ELF path that works.
-KNOWN_TEXT_EMITTERS = {
-    ("x86-64", "x86_64-macos"), ("x86-64", "x86_64-windows"),
-    ("arm64", "aarch64-macos"),
-}
+#: IT IS EMPTY, which is what it was written to become. Every binary backend
+#: now encodes its own instructions and writes its own object for every target
+#: it serves. A pair added back here needs the reason written down with it.
+KNOWN_TEXT_EMITTERS: set[tuple[str, str]] = set()
 
 
 def _machine_targets(backend: str) -> list[str]:
@@ -177,25 +178,42 @@ class TestBinaryBackendsEmitBytes:
             f"{backend} on {target} no longer emits text -- remove the pair "
             f"from KNOWN_TEXT_EMITTERS")
 
-    def test_the_gap_is_only_the_machine_backends(self):
-        """Nothing may be ADDED to the list without this test being edited."""
-        assert KNOWN_TEXT_EMITTERS <= set(BINARY_PAIRS), (
-            "the gap list names a backend and target pair that does not exist")
-        assert {b for b, _ in KNOWN_TEXT_EMITTERS} <= {"x86-64", "arm64"}
+    def test_no_binary_backend_emits_text_any_more(self):
+        """THE FILE'S WHOLE POINT, now that the answer is none.
 
-    @harness.cases("backend,target", [("x86-64", "x86_64-linux"),
-                                      ("arm64", "aarch64-linux"),
-                                      ("arm64", "aarch64-none")])
-    def test_the_pair_writes_its_own_elf(self, backend, target):
-        """The pairs that LEFT the list, asserted rather than merely absent.
-
-        A pair silently dropped from the gap list and from `BINARY_PAIRS` --
-        by a target being renamed, say -- would leave nothing testing it, and
-        the suite would go quiet about the paths that work.
+        This started as a list of backends that stopped at `.s` and let `as`
+        finish. It is empty; the assertion is that it stays that way, and a
+        pair added back has to edit this test and say why.
         """
+        assert KNOWN_TEXT_EMITTERS == set(), (
+            f"a binary backend emits text again: "
+            f"{sorted(KNOWN_TEXT_EMITTERS)}")
+
+    @harness.cases("backend,target",
+                   [p for p in BINARY_PAIRS
+                    if p[0] in ("x86-64", "arm64")])
+    def test_the_pair_writes_its_own_object(self, backend, target):
+        """Every machine pair, asserted rather than merely absent from a list.
+
+        A pair silently dropped from `BINARY_PAIRS` -- by a target being
+        renamed, say -- would leave nothing testing it, and the suite would go
+        quiet about a path that works. Now that the gap list is empty this is
+        the only place the machine backends' output is named.
+        """
+        import struct
         (name, data), = _artifacts(backend, target).items()
-        assert name.endswith(".o"), name
-        assert data[:4] == b"\x7fELF", "not an ELF object"
+        assert name.endswith((".o", ".obj")), name
+        expected = target_registry.get(target).object_format
+        if expected == "elf":
+            assert data[:4] == b"\x7fELF", "not an ELF object"
+        elif expected == "macho":
+            assert struct.unpack_from("<I", data, 0)[0] == 0xFEEDFACF, (
+                "not a 64-bit Mach-O object")
+        else:
+            # COFF HAS NO MAGIC. The first field is the machine number, which
+            # is the only thing at a fixed offset that says what this is.
+            assert struct.unpack_from("<H", data, 0)[0] == 0x8664, (
+                "not an AMD64 COFF object")
 
 
 class TestAnUnfinishedBackendRefuses:

@@ -30,14 +30,16 @@ src/asmpython/
   passes/        pass manager with invariant checking, and transforms
   frontend(s)/   source -> IR         (python: the language, not a subset)
   backend(s)/    IR -> artifacts      (c; x86-64 and arm64, which encode their
-                 own instructions and write ELF objects with no assembler in
-                 the path; jvm; pybc (.pyc); cpyext (a real CPython extension
-                 module, .so/.pyd) -- and five more registered but unfinished:
-                 see `asmpython backends`. `x86` and `arm` are families:
-                 --bits chooses the member)
+                 own instructions and write ELF, COFF and Mach-O objects with
+                 no assembler anywhere in the path; jvm; pybc (.pyc); cpyext
+                 (a real CPython extension module, .so/.pyd) -- and five more
+                 registered but unfinished: see `asmpython backends`. `x86`
+                 and `arm` are families: --bits chooses the member)
   target(s)/     the platforms        (x86_64-*, aarch64-*, c, jvm, pybc,
                  x86_64-{linux,windows}-cpyext)
   link/          artifacts -> program (cc; jar; pyc; cpyext; baremetal; none)
+  backend/objfile/  bytes -> object file (elf; coff; macho -- one writer per
+                 format, shared by every architecture that uses it)
   objects/       what a Python value IS at run time: the object runtime as C,
                  the part of it rewritten in IR, and the floor beneath both
   runtime/       that IR part's source, in asmpython's own machine subset --

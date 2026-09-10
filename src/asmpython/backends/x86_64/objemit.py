@@ -88,18 +88,19 @@ def object_bytes(backend, module: Module, abi, dialect) -> bytes:
     data = bytearray()
     bss = 0
     for g in module.globals:
+        name = backend.global_symbol(g.name, dialect)
         binding = STB_GLOBAL if g.linkage is Linkage.EXPORT else STB_LOCAL
         align = g.align or 8
         if g.data is None:
             bss = (bss + align - 1) & ~(align - 1)
-            symbols.append(Symbol(name=g.name, section=".bss", value=bss,
+            symbols.append(Symbol(name=name, section=".bss", value=bss,
                                   size=max(1, g.size), binding=binding,
                                   kind=STT_OBJECT))
             bss += max(1, g.size)
         else:
             at = (len(data) + align - 1) & ~(align - 1)
             data += b"\0" * (at - len(data))
-            symbols.append(Symbol(name=g.name, section=".data", value=at,
+            symbols.append(Symbol(name=name, section=".data", value=at,
                                   size=len(g.data), binding=binding,
                                   kind=STT_OBJECT))
             data += bytes(g.data)
