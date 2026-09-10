@@ -803,9 +803,19 @@ than an impression.
 | --- | --- |
 | before archiving | 1668/1668 (100%) |
 | after archiving, with 8 modules rebuilt | 1627/1668 (97.5%) |
-| with the library rebuilt | 1665/1668 (99.8%) |
+| with the library rebuilt | 1666/1668 (99.9%) |
 
-**The last measurement found a bug the differential tests could not.** The
+**The two that remain are ABSENCES, not defects, and each is a scope
+decision rather than a fix.** `pep/0749` wants `Format.STRING` from
+`annotationlib`, which needs the annotation thunk to hand back SOURCE
+TEXT: the compiler emits real expression code into it and keeps no
+intermediate form, and there is no unparser bundled to rebuild one.
+`pep/0615` wants `zoneinfo`, which needs the IANA database -- data
+rather than code, and someone has to decide whether a freestanding
+binary carries several hundred kilobytes of zone rules or reads them
+from a host it may not have.
+
+**The measurement before it found a bug the differential tests could not.** The
 conformance shim COMPILES each case to a native binary; `tests/stdlib/` runs
 them through the interpreter. `pep/0519-fspath` passed there and failed here,
 because a class declaring `__slots__` answered a `member_descriptor` for every
