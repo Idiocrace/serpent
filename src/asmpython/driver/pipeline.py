@@ -71,6 +71,9 @@ class Options:
     keep_intermediates: bool = False
     verbose: bool = False
     emit_ir: bool = False
+    #: Ask the backend for its assembly instead of its artifacts. Only a
+    #: machine backend has one; the rest refuse with a reason.
+    emit_asm: bool = False
     show_spans: bool = False
     verify_each: bool = False
     time_passes: bool = False
@@ -349,7 +352,8 @@ def compile_source(opts: Options, sink: DiagnosticSink) -> Result:
         # BEFORE `emit`, so a missing capability is a diagnostic naming the
         # group rather than an undefined symbol naming an object file.
         be.check_host_services(module)
-        result.artifacts = be.emit(module, target)
+        result.artifacts = (be.assembly(module, target) if opts.emit_asm
+                            else be.emit(module, target))
     except BackendUnsupported as exc:
         sink.report(
             error("E9103", f"the {be.name} backend cannot compile this program "

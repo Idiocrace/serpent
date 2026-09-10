@@ -219,6 +219,25 @@ class Backend(abc.ABC):
         `module` has passed verify(). Do not re-check its invariants.
         """
 
+    def assembly(self, module: Module, target: Target) -> dict[str, bytes]:
+        """The same program as ASSEMBLY, for a backend that has one.
+
+        WHY THIS IS PART OF THE INTERFACE and not a private path. A machine
+        backend that writes object files has no reason to produce text on the
+        way there, and once it stops, its assembly is unreachable -- which
+        loses two things worth keeping. A compiler that cannot show you what
+        it generated is much harder to debug than one that can, and the x86
+        lifter's whole input is x86 assembly this backend wrote.
+
+        So the text stays, with a name and a caller: `build --emit-asm`.
+        A backend with no assembly to show refuses, which is the honest
+        answer for the C and JVM backends -- their artifact IS the readable
+        form.
+        """
+        raise BackendUnsupported(
+            f"the {self.name} backend has no assembly form; its artifacts "
+            f"are already the readable output")
+
     def __repr__(self) -> str:
         return f"<backend {self.name}>"
 

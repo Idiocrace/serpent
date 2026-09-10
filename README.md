@@ -13,6 +13,7 @@ asmpython build prog.py --backend jvm --java-version 21   # -> prog.jar
 asmpython build prog.py --backend pybc    # -> prog.pyc, `python prog.pyc` runs it
 asmpython build lib.py --backend cpyext --library   # -> lib.so/.pyd, `import lib`
 asmpython build prog.py --emit            # artifacts only; do not link
+asmpython build prog.py --backend x86-64 --emit-asm   # read the generated code
 asmpython build prog.py --emit-ir         # stop at the IR and read it
 asmpython run prog.py                     # execute in the reference interpreter
 asmpython check prog.py                   # analyse and verify, produce nothing

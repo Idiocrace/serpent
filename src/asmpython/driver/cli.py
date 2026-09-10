@@ -74,7 +74,11 @@ def _options(args) -> Options:
         backend=backend,
         backend_options=dict(getattr(args, "backend_options", None) or {}),
         target=(target_registry.get(target_name) if target_name else None),
-        link=not getattr(args, "emit", False),
+        # `--emit-asm` IMPLIES `--emit`: assembly is not something the
+        # toolchain in this driver links, and asking it to would fail after
+        # the user already has the file they wanted.
+        link=not (getattr(args, "emit", False)
+                  or getattr(args, "emit_asm", False)),
         toolchain=getattr(args, "toolchain", "cc"),
         link_inputs=tuple(getattr(args, "link_input", None) or ()),
         workdir=Path(args.workdir) if getattr(args, "workdir", None) else None,
@@ -83,6 +87,7 @@ def _options(args) -> Options:
         passes=tuple(p for p in (getattr(args, "passes", "") or "").split(",") if p),
         optimise=getattr(args, "optimise", False),
         emit_ir=getattr(args, "emit_ir", False),
+        emit_asm=getattr(args, "emit_asm", False),
         show_spans=getattr(args, "show_spans", False),
         verify_each=getattr(args, "verify_each", False),
         time_passes=getattr(args, "time_passes", False),
@@ -766,6 +771,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="platform to emit for; see `asmpython targets`")
     b.add_argument("--emit", action="store_true",
                    help="write backend artifacts and stop; do not link")
+    b.add_argument("--emit-asm", action="store_true",
+                   help="write the backend's assembly instead of its object "
+                        "file, and stop. For reading what was generated; a "
+                        "backend whose artifact is already readable refuses")
     b.add_argument("--toolchain", default="cc",
                    help="how to turn artifacts into a program "
                         "(see `asmpython toolchains`)")

@@ -103,12 +103,20 @@ def _interpret(module, entry: str) -> list[str]:
 
 
 def _compile_to_assembly(src: str, tmp_path):
+    """The module and the assembly the backend generates for it.
+
+    THROUGH `--emit-asm`, which is the supported way to ask a backend for its
+    text. The backend's ordinary artifact for this target is an object file
+    now; asking for assembly is a different request, and making it through the
+    same option a user would use keeps this test on a path that is maintained
+    rather than one it reaches into privately.
+    """
     target_registry.load_builtin()
     path = tmp_path / "gen.py"
     path.write_text(src, encoding="utf-8")
     sink = DiagnosticSink()
     result = compile_source(
-        Options(source=path, backend="x86-64",
+        Options(source=path, backend="x86-64", emit_asm=True,
                 target=target_registry.get(HOST_TARGET)), sink)
     assert result.ok, [d.message for d in sink.diagnostics] + [src]
     return result.module, result.artifacts["out.s"].decode()

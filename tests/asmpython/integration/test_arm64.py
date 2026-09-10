@@ -218,7 +218,10 @@ entry:
 
         from asmpython.backend import get as get_backend, load_builtin
         load_builtin()
-        asm = get_backend("arm64").emit(
+        # `assembly`, NOT `emit`: the backend's artifact for this target is
+        # an object file, and the claim here is about a narrowing instruction
+        # in the generated code -- which is a question about the text.
+        asm = get_backend("arm64").assembly(
             module, target_registry.get("aarch64-none"))["out.s"].decode()
         assert "sxtb" in asm, "an i8 result must be narrowed back, not kept"
 
